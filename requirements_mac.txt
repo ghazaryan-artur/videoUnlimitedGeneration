@@ -1,0 +1,19 @@
+# macOS desktop build — mirrors requirements.txt minus Windows-only bits.
+# Used by scripts/build_mac.sh.
+httpx[http2]==0.28.1
+pydantic==2.10.4
+pydantic-settings==2.7.1
+sqlmodel==0.0.22
+aiosqlite==0.20.0
+anthropic==0.97.0
+cryptography==44.0.0
+flet[all]==0.25.2
+loguru==0.7.3
+rich==13.9.4
+
+# Browser fallback for login + recorder
+playwright==1.49.1
+playwright-stealth==1.0.6
+
+# Build-only — needed by scripts/build_mac.sh to produce the .app
+pyinstaller==6.11.1

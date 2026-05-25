@@ -1,0 +1,23 @@
+# Server build — Linux (Hetzner VPS)
+# Differs from requirements.txt: winotify excluded (Windows-only)
+httpx[http2]==0.28.1
+pydantic==2.10.4
+pydantic-settings==2.7.1
+sqlmodel==0.0.22
+aiosqlite==0.20.0
+anthropic==0.97.0
+cryptography==44.0.0
+flet[all]==0.25.2
+loguru==0.7.3
+rich==13.9.4
+
+# Hosted HTTP layer (app/ui/server.py): FastAPI in front of Flet so /downloads
+# can return Content-Disposition: attachment without nginx.
+# Note: Flet 0.25 ships its FastAPI integration as the `flet.fastapi` submodule
+# inside the main `flet` package — no separate `flet-fastapi` install needed.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# Browser fallback for login + recorder
+playwright==1.49.1
+playwright-stealth==1.0.6

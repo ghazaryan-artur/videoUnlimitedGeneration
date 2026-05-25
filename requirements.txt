@@ -1,0 +1,19 @@
+# Runtime dependencies — installed via setup.bat
+httpx[http2]==0.28.1
+pydantic==2.10.4
+pydantic-settings==2.7.1
+sqlmodel==0.0.22
+aiosqlite==0.20.0
+winotify==1.1.0
+anthropic==0.97.0
+cryptography==44.0.0
+flet[all]==0.25.2
+loguru==0.7.3
+rich==13.9.4
+
+# Browser fallback for login + recorder
+playwright==1.49.1
+playwright-stealth==1.0.6
+
+# Build-only — pulled in by build.bat when needed:
+#   pyinstaller==6.11.1
