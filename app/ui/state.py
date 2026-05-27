@@ -59,19 +59,37 @@ class AppState:
         self.token = token
         if self.client is not None:
             asyncio.create_task(self.client.aclose())
-        self.client = RunwayClient(token=token.token)
+        self.client = RunwayClient(token=self.token.token)
+
+    def ensure_client(self) -> bool:
+        """Make sure self.client is usable. Re-create from self.token if the
+        previous client was closed (transient websocket disconnect path)
+        or never existed. Returns False only when there is no token to use."""
+        if self.client is not None and not self.client.is_closed:
+            return True
+        if self.token is None:
+            return False
+        self.client = RunwayClient(token=self.token.token)
+        return True
 
     async def teardown(self) -> None:
+        # NOTE: we intentionally drop the references after aclose. Flet may
+        # fire on_disconnect on a transient websocket flicker and then keep
+        # using the same AppState — without this, the next interaction would
+        # pick up a stopped runner / closed client and blow up with
+        # "Cannot send a request, as the client has been closed".
         if self.runner is not None:
             try:
                 await self.runner.aclose()
             except Exception:
                 pass
+            self.runner = None
         if self.client is not None:
             try:
                 await self.client.aclose()
             except Exception:
                 pass
+            self.client = None
 
     # ── job updates pub/sub ───────────────────────────────────────
 

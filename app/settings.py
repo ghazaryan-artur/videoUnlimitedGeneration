@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     poll_max_seconds: float = 60 * 60 * 2  # 2h ceiling per task
     download_timeout_seconds: float = 60 * 10
 
+    # _submit_with_retry: how long we keep retrying 429s before giving up.
+    # Without this cap a job that never gets past Runway's 429 would spin
+    # forever and look "stuck in queue" in the UI.
+    submit_max_seconds: float = 60 * 10  # 10m
+
     # Concurrency
     max_concurrent_jobs: int = 2
 

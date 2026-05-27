@@ -243,6 +243,37 @@ async def get_task_status(client: RunwayClient, task_id: str) -> TaskStatus:
     return TaskStatus.from_response(resp)
 
 
+async def cancel_task(
+    client: RunwayClient,
+    task_id: str,
+    *,
+    team_id: int | str | None = None,
+) -> bool:
+    """Best-effort cancel of a task on Runway's side.
+
+    Uses the REST convention `DELETE /v1/tasks/{id}?asTeamId={team}`. If
+    Runway actually expects a different shape (e.g. POST /cancel), this
+    will return False with a warning logged — local CANCELLED transition
+    in BatchRunner.force_cancel still happens either way, so the UI is
+    never blocked on this call succeeding.
+
+    Returns True on 2xx, False on any error.
+    """
+    path = f"/v1/tasks/{task_id}"
+    if team_id is not None:
+        path += f"?asTeamId={team_id}"
+    try:
+        await client.request("DELETE", path)
+        logger.info("Runway cancel OK  task={}", task_id)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Runway cancel failed (will only cancel locally)  task={} err={}",
+            task_id, e,
+        )
+        return False
+
+
 async def poll_task(
     client: RunwayClient,
     task_id: str,

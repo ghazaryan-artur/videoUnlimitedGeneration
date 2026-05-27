@@ -682,8 +682,47 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
         _update_folder_label()
 
     def cancel_one_job(job: Job) -> None:
-        if state.runner is not None:
-            state.runner.cancel_one(job.id)
+        """Force-cancel a job — works regardless of runner / worker state.
+
+        Always tries to call Runway's DELETE endpoint if the job has a
+        runway_task_id, even when the local runner is gone (post-reconnect)."""
+        logger.info(
+            "cancel_one_job clicked  id={} status={} runway_task_id={}",
+            job.id, job.status.value, job.runway_task_id,
+        )
+
+        async def _do() -> None:
+            logger.info("cancel_one_job _do running  id={}", job.id)
+            from datetime import datetime, timezone
+            from app.core import storage
+            from app.runway.tasks import cancel_task
+
+            # Re-create runner+client if they were nulled by a previous
+            # teardown — this also gives us a fresh client for cancel_task.
+            ensure_runner()
+
+            if state.runner is not None:
+                # Happy path: runner exists. force_cancel handles both
+                # the Runway DELETE and the local CANCELLED transition.
+                await state.runner.force_cancel(job)
+            else:
+                # No runner could be created (no token?). Still try to
+                # stop the task on Runway, then mark CANCELLED locally.
+                logger.warning("cancel_one_job: state.runner still None — manual fallback")
+                if job.runway_task_id and state.client is not None:
+                    try:
+                        await cancel_task(state.client, job.runway_task_id)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("manual cancel_task failed: {}", e)
+                job.status = JobStatus.CANCELLED
+                job.completed_at = datetime.now(timezone.utc)
+                try:
+                    await storage.upsert_job(job)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("storage upsert in cancel_one_job: {}", e)
+                state.emit_job_update(job)
+            rebuild()
+        page.run_task(_do)
 
     def open_for_job(job: Job) -> None:
         # In a hosted web deployment, _open_folder() runs xdg-open on the
@@ -952,8 +991,15 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
             pass
 
     def ensure_runner() -> None:
-        """Create the persistent runner once per session if not already."""
-        if state.runner is None and state.client is not None:
+        """Create the persistent runner once per session if not already.
+
+        Also handles the post-disconnect recovery path: if state.client was
+        closed by a previous teardown, re-create it from the saved token
+        before wiring the runner.
+        """
+        if not state.ensure_client():
+            return
+        if state.runner is None:
             if not getattr(state.client, "_db_sink_attached", False):
                 state.client.add_sink(make_db_log_sink(task_id_from_url))
                 state.client._db_sink_attached = True  # type: ignore[attr-defined]
@@ -1008,14 +1054,91 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
         page.update()
 
     def cancel_all_batch(_: ft.ControlEvent) -> None:
-        if state.runner:
-            state.runner.cancel_all()
+        """Force-cancel every non-terminal job — also hits Runway DELETE
+        on each one with a task_id, regardless of runner state."""
+        async def _do() -> None:
+            from datetime import datetime, timezone
+            from app.core import storage
+            from app.runway.tasks import cancel_task
+
+            active = [j for j in state.active_jobs.values() if not j.status.is_terminal]
+            if not active:
+                return
+
+            ensure_runner()
+
+            if state.runner is not None:
+                await state.runner.force_cancel_all(active)
+            else:
+                # Manual fallback: per-job Runway DELETE + local cancel.
+                logger.warning("cancel_all_batch: state.runner still None — manual fallback")
+                for job in active:
+                    if job.runway_task_id and state.client is not None:
+                        try:
+                            await cancel_task(state.client, job.runway_task_id)
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning("manual cancel_task failed: {}", e)
+                    job.status = JobStatus.CANCELLED
+                    job.completed_at = datetime.now(timezone.utc)
+                    try:
+                        await storage.upsert_job(job)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("storage upsert in cancel_all_batch: {}", e)
+                    state.emit_job_update(job)
+            rebuild()
+        page.run_task(_do)
 
     def open_output(_: ft.ControlEvent) -> None:
         if is_web_mode():
             page.go("/downloads")
             return
         _open_folder(output_dir())
+
+    async def do_sync_with_runway(_: ft.ControlEvent | None = None) -> None:
+        """Cross-check active jobs against Runway and patch local state.
+
+        Useful when the local UI shows QUEUED forever while Runway has long
+        finished / rejected / lost the task (typical after a session
+        reconnect where the polling worker died)."""
+        ensure_runner()
+        if state.runner is None or state.client is None:
+            return
+        active = [j for j in state.active_jobs.values() if not j.status.is_terminal]
+        if not active:
+            return
+        try:
+            sync_btn.disabled = True
+            sync_btn.update()
+        except Exception:
+            pass
+        try:
+            summary = await state.runner.sync_with_runway(active)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("sync_with_runway failed: {}", e)
+            page.snack_bar = ft.SnackBar(
+                ft.Text(f"Sync failed: {type(e).__name__}: {e}"),
+                bgcolor=theme.Colors.state_failed,
+            )
+            page.snack_bar.open = True
+            page.update()
+            return
+        finally:
+            try:
+                sync_btn.disabled = False
+                sync_btn.update()
+            except Exception:
+                pass
+
+        msg = (
+            f"Synced {summary['checked']} job"
+            f"{'s' if summary['checked'] != 1 else ''}"
+            f"  •  {summary['updated']} updated"
+        )
+        if summary["missing"]:
+            msg += f"  •  {summary['missing']} missing on Runway"
+        page.snack_bar = ft.SnackBar(ft.Text(msg), bgcolor=theme.Colors.surface_2)
+        page.snack_bar.open = True
+        rebuild()
 
     def go_debug(_: ft.ControlEvent) -> None:
         page.go("/debug")
@@ -1475,6 +1598,12 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
         tooltip="Check task by ID",
         on_click=check_task_by_id,
     )
+    sync_btn = ft.IconButton(
+        icon=ft.Icons.SYNC,
+        icon_color=theme.Colors.text_secondary,
+        tooltip="Sync active jobs with Runway",
+        on_click=lambda e: page.run_task(do_sync_with_runway, e),
+    )
     history_btn = ft.IconButton(
         icon=ft.Icons.HISTORY,
         icon_color=theme.Colors.text_secondary,
@@ -1525,6 +1654,7 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
                         import_btn,
                         templates_btn,
                         check_id_btn,
+                        sync_btn,
                         history_btn,
                         license_mgr_btn,
                         open_btn,
@@ -1732,6 +1862,17 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
             await state.runner.resume_jobs(new_ids)
         except Exception as e:  # noqa: BLE001
             logger.exception("resume failed: {}", e)
+
+        # Cross-check resumed jobs against Runway right away — covers the
+        # common "worker died, status is frozen" case after a session
+        # reconnect. The runner's normal poll loop will also catch this
+        # eventually, but the user shouldn't have to wait through a 5s
+        # interval per job to see the truth.
+        try:
+            await state.runner.sync_with_runway(new_ids)
+            rebuild()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("post-resume sync failed: {}", e)
 
     page.run_task(attempt_resume)
 

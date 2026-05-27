@@ -14,8 +14,8 @@ from typing import Callable
 import flet as ft
 import flet.fastapi as flet_fastapi
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, PlainTextResponse, Response
 from loguru import logger
 
 from app.paths import output_dir
@@ -50,22 +50,38 @@ def _safe_download_path(filename: str):
 def build_app(target: SessionHandler) -> FastAPI:
     api = FastAPI(title="RunwayAutomation")
 
-    @api.get("/downloads/{filename}")
-    async def download(filename: str) -> FileResponse:
-        path = _safe_download_path(filename)
-        # media_type=octet-stream + filename= → Content-Disposition: attachment;
-        # filename="...". Forces the browser to download rather than play inline.
-        return FileResponse(
-            path,
-            media_type="application/octet-stream",
-            filename=path.name,
-        )
+    @api.middleware("http")
+    async def downloads_intercept(request: Request, call_next):
+        """Serve /downloads/<file> BEFORE routing reaches Flet's mount.
 
-    @api.get("/healthz")
-    async def healthz() -> dict[str, str]:
-        return {"status": "ok"}
+        Plain FastAPI routes don't work here: `api.mount("/", flet_fastapi.app(...))`
+        is a Mount whose Starlette matcher claims every path, and the mounted
+        Flet app responds to anything it doesn't know with its SPA index.html
+        — including `/downloads/<file>`. Middleware runs ahead of the router,
+        so this short-circuits the request before Flet sees it.
+        """
+        path = request.url.path
+        if path.startswith("/downloads/") and len(path) > len("/downloads/"):
+            # ASGI scope path is already URL-decoded by Starlette, so spaces
+            # arrive as ' ' (not %20).
+            filename = path[len("/downloads/"):]
+            try:
+                file_path = _safe_download_path(filename)
+            except HTTPException as e:
+                return PlainTextResponse(
+                    str(e.detail or ""), status_code=e.status_code,
+                )
+            return FileResponse(
+                file_path,
+                media_type="application/octet-stream",
+                filename=file_path.name,
+            )
+        if path == "/healthz":
+            return Response(content='{"status":"ok"}',
+                            media_type="application/json")
+        return await call_next(request)
 
-    # Mount Flet last so our explicit routes win over its catch-all.
+    # Flet owns everything else.
     api.mount("/", flet_fastapi.app(target))
     return api
 

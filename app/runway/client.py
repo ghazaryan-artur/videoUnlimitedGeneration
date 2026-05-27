@@ -68,6 +68,11 @@ class RunwayClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    @property
+    def is_closed(self) -> bool:
+        """True after `aclose()` (or after a context-manager exit)."""
+        return self._client.is_closed
+
     async def __aenter__(self) -> "RunwayClient":
         return self
 

@@ -38,6 +38,7 @@ from app.runway.client import ApiLogEntry, RunwayApiError, RunwayClient
 from app.runway.models import by_task_type
 from app.runway.tasks import (
     SessionContext,
+    cancel_task,
     download_artifact,
     ensure_session,
     get_task_status,
@@ -165,6 +166,97 @@ class BatchRunner:
             self._known_ids.add(j.id)
             await self._queue.put(j)
 
+    async def sync_with_runway(self, jobs: list[Job]) -> dict[str, int]:
+        """One-shot reconciliation against Runway.
+
+        Use this when the UI is suspected to be stale — e.g. workers died on
+        a session reload and the local state is frozen on QUEUED while
+        Runway has long since moved on.
+
+        For each non-terminal job with a `runway_task_id`, hit Runway and
+        force the local state to match:
+          SUCCEEDED         → DOWNLOADING (re-queued so worker downloads it)
+          FAILED            → FAILED
+          CANCELLED         → CANCELLED
+          RUNNING           → GENERATING
+          PENDING/THROTTLED → QUEUED (no-op)
+          HTTP 404          → FAILED with "task no longer exists on Runway"
+
+        Jobs without a `runway_task_id` are skipped here — they belong to
+        the _submit_with_retry loop, which has its own deadline.
+
+        Returns a summary {checked, updated, missing}.
+        """
+        summary = {"checked": 0, "updated": 0, "missing": 0}
+        for job in jobs:
+            if job.status.is_terminal or not job.runway_task_id:
+                continue
+            summary["checked"] += 1
+            try:
+                status = await get_task_status(self._client, job.runway_task_id)
+            except RunwayApiError as e:
+                if e.status == 404:
+                    summary["missing"] += 1
+                    await self._fail(job, "Task no longer exists on Runway")
+                else:
+                    logger.warning(
+                        "sync_with_runway: {} → API {}: {}",
+                        job.runway_task_id, e.status, str(e)[:200],
+                    )
+                continue
+            except Exception as e:  # noqa: BLE001
+                logger.warning("sync_with_runway: {} → {}", job.runway_task_id, e)
+                continue
+
+            if status.status == "SUCCEEDED":
+                if status.artifacts:
+                    self._artifacts_cache[job.id] = status.artifacts
+                job.transition_to(
+                    JobStatus.DOWNLOADING,
+                    completed_at=job.completed_at or _now(),
+                    progress_ratio=status.progress_ratio,
+                )
+                await storage.upsert_job(job)
+                self._notify(job)
+                summary["updated"] += 1
+                # Re-queue so the worker picks up the download path.
+                # add_jobs() de-dupes by job.id via _known_ids; drop the id
+                # first so the re-queue actually goes through.
+                self._known_ids.discard(job.id)
+                await self.add_jobs([job], is_resume=True)
+                continue
+            if status.status == "FAILED":
+                await self._fail(job, status.error or "Runway returned FAILED")
+                summary["updated"] += 1
+                continue
+            if status.status == "CANCELLED":
+                await self._mark_cancelled(job)
+                summary["updated"] += 1
+                continue
+
+            if status.status == "RUNNING":
+                new_status = JobStatus.GENERATING
+                if job.started_at is None:
+                    job.started_at = _now()
+            elif status.status in ("PENDING", "THROTTLED"):
+                new_status = JobStatus.QUEUED
+            else:
+                new_status = job.status
+
+            changed = (
+                new_status != job.status
+                or job.progress_ratio != status.progress_ratio
+                or job.estimated_start_seconds != status.estimated_start_seconds
+            )
+            if changed:
+                job.status = new_status
+                job.progress_ratio = status.progress_ratio
+                job.estimated_start_seconds = status.estimated_start_seconds
+                await storage.upsert_job(job)
+                self._notify(job)
+                summary["updated"] += 1
+        return summary
+
     # Backward-compat aliases — keep run_batch / resume_jobs wrappers
     async def run_batch(self, jobs: list[Job], *, batch_name: str = "") -> None:
         await self.add_jobs(jobs, batch_name=batch_name, is_resume=False)
@@ -222,6 +314,66 @@ class BatchRunner:
         if t is not None and not t.done():
             t.cancel()
 
+    async def force_cancel(self, job: Job) -> None:
+        """Cancel a job whether or not a worker is currently processing it.
+
+        Tries the graceful path first (cancel_one on an in-flight task);
+        if the job isn't in-flight — for example because the worker died
+        before picking it up, or the job sat untouched in the queue — falls
+        back to directly transitioning it to CANCELLED via storage + notify.
+
+        If the job already has a `runway_task_id`, also tries to cancel it
+        on Runway's side (best-effort: logs warning and continues if their
+        API rejects). This stops the actual generation from finishing and
+        eating credits.
+
+        Use this from the UI Cancel button so the user can always get rid
+        of a stuck card, even when the runner is in a broken state.
+        """
+        await self._cancel_on_runway_if_needed(job)
+        if self.cancel_one(job.id):
+            return  # graceful path — _run_one's CancelledError handler fires _mark_cancelled
+        self._known_ids.discard(job.id)
+        await self._mark_cancelled(job)
+
+    async def force_cancel_all(self, jobs: list[Job]) -> None:
+        """Force-cancel every non-terminal job in the supplied list."""
+        # Try to stop them on Runway first (in parallel, best-effort).
+        await asyncio.gather(
+            *(self._cancel_on_runway_if_needed(j) for j in jobs if not j.status.is_terminal),
+            return_exceptions=True,
+        )
+        # Schedule the existing graceful cancel for everything we know
+        # about (in-flight + queue). Runs on next loop tick.
+        self.cancel_all()
+        # Then explicitly mark CANCELLED any job that is NOT in-flight, so
+        # we don't depend on workers being alive to make the UI update.
+        for job in jobs:
+            if job.status.is_terminal:
+                continue
+            if job.id in self._inflight:
+                continue  # cancel_all() will handle this one
+            self._known_ids.discard(job.id)
+            await self._mark_cancelled(job)
+
+    async def _cancel_on_runway_if_needed(self, job: Job) -> None:
+        """Best-effort DELETE /v1/tasks/<id> on Runway. No-op if the job
+        was never submitted there yet."""
+        if not job.runway_task_id:
+            logger.info(
+                "_cancel_on_runway_if_needed skip  job={} (no runway_task_id)",
+                job.id,
+            )
+            return
+        team_id: int | str | None = None
+        if self._session_ctx is not None:
+            team_id = self._session_ctx.team_id
+        logger.info(
+            "_cancel_on_runway_if_needed calling cancel_task  task={} team={}",
+            job.runway_task_id, team_id,
+        )
+        await cancel_task(self._client, job.runway_task_id, team_id=team_id)
+
     async def aclose(self) -> None:
         """Graceful shutdown — used by AppState.teardown.
 
@@ -248,22 +400,45 @@ class BatchRunner:
     # ── worker loop ──────────────────────────────────────────────────
 
     async def _worker_loop(self, worker_index: int) -> None:
-        while not self._cancel_event.is_set():
-            try:
-                job = await asyncio.wait_for(self._queue.get(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
+        # Wait directly on the queue, no wait_for/timeout. Pre-3.12 Pythons
+        # have a race where wait_for can drop an item that get() already
+        # pulled out, leaving the job stuck in PENDING with no one polling
+        # it (CPython issue #94720). Shutdown is signalled by aclose()
+        # putting one None sentinel per worker.
+        while True:
+            job = await self._queue.get()
             if job is None:
-                # sentinel
                 return
-            current = asyncio.current_task()
-            if current is not None:
-                self._inflight[job.id] = current
+            if self._cancel_event.is_set():
+                # Soft shutdown happened while we were blocked on get().
+                # Put the job back so the next session's resume_jobs picks
+                # it up, then exit.
+                with suppress(asyncio.QueueFull):
+                    self._queue.put_nowait(job)
+                return
+
+            # Run the job in a child task and store THAT in _inflight.
+            # Previously _inflight held `current` (= the worker task), so
+            # cancel_one() cancelled the worker itself — after one user
+            # cancel the worker died and the remaining queued jobs sat
+            # untouched. With a per-job sub-task, cancel_one only kills
+            # this job; the worker survives to pick up the next item.
+            job_task: asyncio.Task[Any] = asyncio.create_task(
+                self._run_one(job), name=f"runway-job-{job.id}",
+            )
+            self._inflight[job.id] = job_task
             try:
-                await self._run_one(job)
+                await job_task
             except asyncio.CancelledError:
-                # _run_one handled marking based on explicit vs soft mode
-                raise
+                if self._cancel_event.is_set():
+                    # Full shutdown signalled (aclose). Let it propagate.
+                    raise
+                # Per-job cancel — _run_one already marked the job
+                # CANCELLED. Stay alive and pick up the next one.
+                logger.info(
+                    "worker {} job {} cancelled — continuing",
+                    worker_index, job.id,
+                )
             except Exception:  # noqa: BLE001
                 logger.exception("worker {} crashed on job {}", worker_index, job.id)
             finally:
@@ -337,7 +512,13 @@ class BatchRunner:
         if self._session_ctx is None:
             self._session_ctx = await ensure_session(self._client)
         profile = by_task_type(job.model_task_type)
-        job.transition_to(JobStatus.SUBMITTING, submitted_at=_now())
+        # Preserve the original submission start across resumes so the
+        # submit-deadline ticks against real wall-clock time, not since the
+        # latest worker pickup.
+        if job.submitted_at is None:
+            job.submitted_at = _now()
+        deadline_at = job.submitted_at.timestamp() + settings.submit_max_seconds
+        job.transition_to(JobStatus.SUBMITTING)
         await storage.upsert_job(job)
         self._notify(job)
 
@@ -345,6 +526,16 @@ class BatchRunner:
         while True:
             if self._cancel_event.is_set():
                 await self._mark_cancelled(job)
+                return
+            if _now().timestamp() >= deadline_at:
+                # Persistent 429 (or whatever else) — stop pretending we're in
+                # a queue when we never reached Runway. Surface as FAILED so
+                # the user can retry instead of staring at a stuck card.
+                await self._fail(
+                    job,
+                    f"Could not submit to Runway after {int(settings.submit_max_seconds)}s "
+                    "(persistent 429 / capacity). Retry from history.",
+                )
                 return
             try:
                 runway_task_id = await submit_task(
