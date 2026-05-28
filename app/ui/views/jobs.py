@@ -1194,7 +1194,7 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
             "CSV format (first line = headers):\n"
             "  prompt, model, duration, aspect, resolution, audio, count, output_dir, name\n\n"
             "Required: prompt.   Optional: everything else (defaults applied).\n"
-            "  • model:    seedance_2 | kling_3_0_pro | happyhorse_1_0\n"
+            "  • model:    seedance_2 | kling_3_0_pro | kling_3_0_4k | kling_o3_4k | happyhorse_1_0\n"
             "  • duration: 3 | 5 | 10 | 15  (model-dependent)\n"
             "  • aspect:   16:9 | 9:16 | 1:1 | 3:4 | 4:3  (model-dependent)\n"
             "  • audio:    true | false\n"
