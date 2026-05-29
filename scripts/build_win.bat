@@ -22,6 +22,7 @@ REM -- locate project root (parent of scripts\) ------------------------
 set "SCRIPT_DIR=%~dp0"
 pushd "%SCRIPT_DIR%.."
 set "ROOT=%CD%"
+set "ERR=0"
 
 REM -- parse flags -----------------------------------------------------
 set "WITH_PLAYWRIGHT=1"
@@ -37,32 +38,50 @@ echo Usage: scripts\build_win.bat [--no-playwright]
 popd & exit /b 0
 :afterargs
 
-REM -- find Python 3.12 ------------------------------------------------
+REM -- find a compatible Python (need 3.10-3.13; 3.12 recommended) ----
+REM PyInstaller 6.11.1 and the pinned deps do NOT support Python 3.14.
 set "PY="
-py -3.12 --version >nul 2>&1 && set "PY=py -3.12"
-if not defined PY (
-  python --version >nul 2>&1 && set "PY=python"
+for %%V in (3.12 3.11 3.13 3.10) do (
+  if not defined PY (
+    py -%%V --version >nul 2>&1 && set "PY=py -%%V"
+  )
 )
 if not defined PY (
-  echo ERROR: Python not found. Install Python 3.12 from python.org
-  echo        ^(make sure "py launcher" / "Add to PATH" is checked^).
-  popd & exit /b 1
+  REM last resort: bare "python", but only if it is in [3.10, 3.14)
+  python -c "import sys; raise SystemExit(0 if (3,10)<=sys.version_info<(3,14) else 1)" >nul 2>&1 && set "PY=python"
+)
+if not defined PY (
+  echo ERROR: No compatible Python found.
+  echo        Need Python 3.10-3.13 ^(3.12 recommended^); 3.14 is NOT supported
+  echo        by pyinstaller==6.11.1 or the pinned wheels.
+  echo        Install Python 3.12: https://www.python.org/downloads/release/python-3128/
+  set "ERR=1" & goto fail
 )
 echo [build_win] using interpreter: %PY%
 %PY% --version
 
 REM -- venv ------------------------------------------------------------
 set "VENV=%ROOT%\.venv_win"
+REM Recreate the venv if it was built on an incompatible Python (e.g. 3.14).
+if exist "%VENV%\Scripts\python.exe" (
+  "%VENV%\Scripts\python.exe" -c "import sys; raise SystemExit(0 if (3,10)<=sys.version_info<(3,14) else 1)" >nul 2>&1
+  if errorlevel 1 (
+    echo [build_win] existing .venv_win uses an incompatible Python -- recreating ...
+    rmdir /s /q "%VENV%"
+  )
+)
 if not exist "%VENV%" (
   echo [build_win] creating %VENV% ...
   %PY% -m venv "%VENV%"
-  if errorlevel 1 ( echo ERROR: venv creation failed & popd & exit /b 1 )
+  if errorlevel 1 ( echo ERROR: venv creation failed & set "ERR=1" & goto fail )
 )
 set "VPY=%VENV%\Scripts\python.exe"
+echo [build_win] venv python:
+"%VPY%" --version
 "%VPY%" -m pip install --upgrade pip wheel >nul
 echo [build_win] installing deps from requirements.txt ...
 "%VPY%" -m pip install -r "%ROOT%\requirements.txt" pyinstaller==6.11.1
-if errorlevel 1 ( echo ERROR: pip install failed & popd & exit /b 1 )
+if errorlevel 1 ( echo ERROR: pip install failed & set "ERR=1" & goto fail )
 
 REM -- playwright browser cache ---------------------------------------
 if "%WITH_PLAYWRIGHT%"=="1" (
@@ -115,13 +134,13 @@ if "%KEY_EMBEDDED%"=="1" (
 
 if not "%PYI_ERR%"=="0" (
   echo ERROR: PyInstaller failed with code %PYI_ERR%
-  popd & exit /b %PYI_ERR%
+  set "ERR=%PYI_ERR%" & goto fail
 )
 
 set "APPDIR=%ROOT%\dist\win\RunwayAutomation"
 if not exist "%APPDIR%\RunwayAutomation.exe" (
   echo ERROR: PyInstaller did not produce %APPDIR%\RunwayAutomation.exe
-  popd & exit /b 1
+  set "ERR=1" & goto fail
 )
 
 REM -- bundle Playwright Chromium next to the .exe --------------------
@@ -148,7 +167,22 @@ echo [build_win]   exe:    %APPDIR%\RunwayAutomation.exe
 echo.
 echo Run locally:  "%APPDIR%\RunwayAutomation.exe"
 echo Distribute:   zip the whole RunwayAutomation\ folder (the .exe needs _internal\ next to it)
+goto done
 
+:fail
+echo.
+echo ============================================================
+echo  BUILD FAILED (code %ERR%). Scroll up to the FIRST red error.
+echo ============================================================
 popd
+echo.
+pause
+endlocal
+exit /b %ERR%
+
+:done
+popd
+echo.
+pause
 endlocal
 exit /b 0
