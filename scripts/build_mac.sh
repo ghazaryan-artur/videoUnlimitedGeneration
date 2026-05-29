@@ -126,6 +126,7 @@ pyinstaller \
   --target-arch arm64 \
   --workpath "$ROOT/build/runway_app_mac" \
   --distpath "$ROOT/dist/mac" \
+  --specpath "$ROOT/build" \
   --collect-all flet \
   --collect-all flet_runtime \
   --collect-data certifi \
