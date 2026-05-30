@@ -143,9 +143,10 @@ class PromptCard:
             visible=not is_web,
         )
         path_input = ft.TextField(
-            label="Output path (server folder)",
+            label="Output subfolder (inside downloads/)",
             value=self.draft.output_dir or "",
-            hint_text=str(output_dir()),
+            hint_text="e.g. cats/cute  -  leave blank for downloads/ root",
+            helper_text="Paths above downloads/ are not allowed and will be clamped.",
             on_change=self._on_path_input_change,
             bgcolor=theme.Colors.surface_2,
             border_color=theme.Colors.border,

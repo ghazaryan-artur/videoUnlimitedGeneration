@@ -33,7 +33,7 @@ from loguru import logger
 
 from app.core import storage
 from app.core.job import Batch, Job, JobStatus
-from app.paths import output_dir
+from app.paths import output_dir, resolve_output_dir
 from app.runway.client import ApiLogEntry, RunwayApiError, RunwayClient
 from app.runway.models import by_task_type
 from app.runway.tasks import (
@@ -308,6 +308,41 @@ class BatchRunner:
         self._loop.call_soon_threadsafe(self._do_cancel_one, job_id)
         return True
 
+    def is_inflight(self, job_id: str) -> bool:
+        """True if a worker is currently running this job."""
+        return job_id in self._inflight
+
+    def purge_pending(self, job_id: str) -> None:
+        """Drop a PENDING job that never reached Runway.
+
+        Drains the asyncio queue, dropping the matching entry. A worker
+        that has not yet picked the job up will simply never see it. If a
+        worker is mid-pickup (rare race), `_run_one` notices that the id
+        was removed from _known_ids and exits without submitting.
+
+        Safe to call from any thread; the drain runs on the runner loop.
+        Caller is responsible for deleting the row from the DB and
+        removing the card from the UI.
+        """
+        if self._loop is None:
+            return
+        self._loop.call_soon_threadsafe(self._do_purge_pending, job_id)
+
+    def _do_purge_pending(self, job_id: str) -> None:
+        # Drop the id BEFORE draining so an in-flight pickup also bails.
+        self._known_ids.discard(job_id)
+        kept: list[Job | None] = []
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if item is not None and item.id == job_id:
+                continue  # the one we're dropping
+            kept.append(item)  # other jobs and None sentinels stay
+        for item in kept:
+            self._queue.put_nowait(item)
+
     def _do_cancel_one(self, job_id: str) -> None:
         self._explicit_cancel = True  # so the about-to-fire CancelledError marks CANCELLED
         t = self._inflight.get(job_id)
@@ -449,6 +484,13 @@ class BatchRunner:
     async def _run_one(self, job: Job) -> None:
         if self._cancel_event.is_set():
             await self._mark_cancelled(job)
+            return
+        # Race-guard for purge_pending(): if the job's id was discarded from
+        # _known_ids while the worker was racing through queue.get(), abort
+        # before any network call. The job has already been deleted from DB
+        # + UI by the caller; do not resurrect it.
+        if job.id not in self._known_ids:
+            logger.info("worker dropped purged job {} (no submit)", job.id)
             return
         try:
             # Branch: fresh submission vs. resume
@@ -660,8 +702,9 @@ class BatchRunner:
                 job.progress_ratio = min(1.0, written / total)
             self._notify(job)
 
-        # Per-job output dir override (from PromptDraft.output_dir)
-        dest_dir = Path(job.output_dir) if job.output_dir else output_dir()
+        # Per-job output dir override (from PromptDraft.output_dir).
+        # resolve_output_dir() clamps web-mode paths to downloads/ root.
+        dest_dir = resolve_output_dir(job.output_dir)
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:  # noqa: BLE001

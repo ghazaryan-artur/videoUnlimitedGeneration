@@ -1,12 +1,34 @@
 """Job — one row in the batch table; the unit the queue moves around."""
 from __future__ import annotations
 
+import re
 import secrets
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _first_words(text: str, n: int = 5) -> str:
+    matches = _WORD_RE.findall(text or "")
+    return " ".join(matches[:n])
+
+
+def safe_folder_name(s: str, *, max_len: int = 80) -> str:
+    """Sanitise a string for use as a folder name on any filesystem.
+
+    Keeps letters/digits/spaces/dashes/dots/underscores, collapses runs of
+    whitespace, length-caps to max_len. Returns "untitled" if nothing left.
+    """
+    cleaned = re.sub(r"[^\w\s.\-]", "", s or "", flags=re.UNICODE).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip()
+    return cleaned or "untitled"
 
 
 class JobStatus(str, Enum):
@@ -27,7 +49,7 @@ class JobStatus(str, Enum):
 
     @property
     def is_active(self) -> bool:
-        return self in (JobStatus.SUBMITTING, JobStatus.QUEUED,
+        return self in (JobStatus.PENDING, JobStatus.SUBMITTING, JobStatus.QUEUED,
                         JobStatus.GENERATING, JobStatus.DOWNLOADING)
 
 
@@ -147,8 +169,30 @@ class PromptDraft(BaseModel):
             return f"{base} #{index + 1}"
         return base
 
+    def auto_folder(self) -> str:
+        """Folder name to group all videos from this draft under, when the
+        user didn't specify one explicitly. Prefers the user-set name,
+        falls back to the first 5 words of the prompt."""
+        base = (self.name or "").strip()
+        if not base:
+            base = _first_words(self.prompt, 5)
+        return safe_folder_name(base)
+
     def expand(self) -> list[Job]:
-        """Materialize into one Job per video to generate."""
+        """Materialize into one Job per video to generate.
+
+        Web mode only: if the user didn't set output_dir, all videos from
+        this draft are grouped into a folder derived from `name` / first 5
+        prompt words. Desktop mode behaviour is unchanged (output_dir is
+        passed through as-is — None means the default Videos folder).
+        """
+        from app.paths import is_web_mode  # local to avoid circular import
+        if self.output_dir and self.output_dir.strip():
+            folder = self.output_dir
+        elif is_web_mode():
+            folder = self.auto_folder()
+        else:
+            folder = None
         jobs: list[Job] = []
         for i in range(max(1, self.count)):
             jobs.append(Job(
@@ -159,6 +203,6 @@ class PromptDraft(BaseModel):
                 resolution=self.resolution,
                 audio=self.audio,
                 name=self.make_name_for(i),
-                output_dir=self.output_dir,
+                output_dir=folder,
             ))
         return jobs

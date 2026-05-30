@@ -684,12 +684,37 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
     def cancel_one_job(job: Job) -> None:
         """Force-cancel a job — works regardless of runner / worker state.
 
-        Always tries to call Runway's DELETE endpoint if the job has a
-        runway_task_id, even when the local runner is gone (post-reconnect)."""
+        Two paths:
+          - PENDING and never sent to Runway (no runway_task_id, not in
+            flight): PURGE — delete row + card entirely, no Runway call,
+            no CANCELLED record left behind.
+          - Anything else: graceful force_cancel — DELETE on Runway if a
+            task_id is known, mark CANCELLED locally.
+        """
         logger.info(
             "cancel_one_job clicked  id={} status={} runway_task_id={}",
             job.id, job.status.value, job.runway_task_id,
         )
+
+        # Purge path: job never reached Runway and no worker is on it yet.
+        if (
+            job.status == JobStatus.PENDING
+            and not job.runway_task_id
+            and (state.runner is None or not state.runner.is_inflight(job.id))
+        ):
+            async def _do_purge() -> None:
+                from app.core import storage
+                logger.info("cancel_one_job: purging PENDING job {}", job.id)
+                if state.runner is not None:
+                    state.runner.purge_pending(job.id)
+                try:
+                    await storage.delete_job(job.id)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("purge: delete_job failed: {}", e)
+                state.active_jobs.pop(job.id, None)
+                rebuild()
+            page.run_task(_do_purge)
+            return
 
         async def _do() -> None:
             logger.info("cancel_one_job _do running  id={}", job.id)

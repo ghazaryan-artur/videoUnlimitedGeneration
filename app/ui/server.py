@@ -24,20 +24,28 @@ from app.paths import output_dir
 SessionHandler = Callable[[ft.Page], "object"]
 
 
-def _safe_download_path(filename: str):
+def _safe_download_path(rel_path: str):
     """Return an existing regular file inside output_dir() — or raise 404/400.
 
-    Defends against path traversal: only bare filenames (no slashes, no `..`)
-    are accepted, and we re-check that the resolved path stays inside the
-    downloads root.
+    Defends against path traversal. Multi-segment paths separated by `/`
+    are accepted (so files in subfolders can be served), but every segment
+    is checked against `..`, leading dots, and the resolved absolute path
+    is re-verified to stay inside the downloads root.
     """
-    if not filename or any(c in filename for c in ("/", "\\", "\x00")):
+    if not rel_path:
         raise HTTPException(status_code=400, detail="bad filename")
-    if filename in (".", "..") or filename.startswith("."):
+    if any(c in rel_path for c in ("\\", "\x00")):
         raise HTTPException(status_code=400, detail="bad filename")
 
+    segments = [s for s in rel_path.split("/") if s]
+    if not segments:
+        raise HTTPException(status_code=400, detail="bad filename")
+    for seg in segments:
+        if seg in (".", "..") or seg.startswith("."):
+            raise HTTPException(status_code=400, detail="bad filename")
+
     root = output_dir().resolve()
-    path = (root / filename).resolve()
+    path = root.joinpath(*segments).resolve()
     try:
         path.relative_to(root)
     except ValueError:
@@ -76,6 +84,24 @@ def build_app(target: SessionHandler) -> FastAPI:
                 media_type="application/octet-stream",
                 filename=file_path.name,
             )
+        if path.startswith("/thumbs/") and len(path) > len("/thumbs/"):
+            # /thumbs/<video_name>.jpg — first frame of <video_name>, generated
+            # lazily by ffmpeg and cached to <output_dir>/.thumbs/.
+            thumb_filename = path[len("/thumbs/"):]
+            if not thumb_filename.endswith(".jpg"):
+                return PlainTextResponse("bad filename", status_code=400)
+            video_filename = thumb_filename[:-4]
+            try:
+                video_path = _safe_download_path(video_filename)
+            except HTTPException as e:
+                return PlainTextResponse(
+                    str(e.detail or ""), status_code=e.status_code,
+                )
+            from app.core.thumbs import ensure_thumb
+            thumb = ensure_thumb(video_path)
+            if thumb is None or not thumb.exists():
+                return PlainTextResponse("no thumbnail", status_code=404)
+            return FileResponse(thumb, media_type="image/jpeg")
         if path == "/healthz":
             return Response(content='{"status":"ok"}',
                             media_type="application/json")

@@ -1,6 +1,17 @@
-"""Downloads view — lists mp4s served from the web /downloads/ static tree."""
+"""Downloads view — lists mp4s served from the web /downloads/ static tree.
+
+Layout
+------
+Root view: one card per top-level subfolder of downloads/ (with the FIRST
+(oldest) video's thumbnail as preview, the count, the total size, and the
+latest mtime), plus any loose files saved directly into downloads/ root.
+
+Click a folder card → "inside a folder" view shows individual video rows
+(thumbnail, name, size+date, model, generation time, download link).
+"""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -8,9 +19,26 @@ from urllib.parse import quote
 import flet as ft
 from loguru import logger
 
+from app.core.job import Job
+from app.core.storage import list_recent_jobs
 from app.paths import is_web_mode, output_dir
+from app.runway.models import by_task_type
 from app.ui import theme
 from app.ui.state import AppState
+
+
+# ── data types ────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class FileEntry:
+    path: Path
+    rel_path: str         # path relative to downloads/, using forward slashes
+    size: int
+    mtime: datetime
+
+
+# ── formatting helpers ────────────────────────────────────────────────
 
 
 def _format_bytes(n: int) -> str:
@@ -23,55 +51,182 @@ def _format_bytes(n: int) -> str:
     return f"{n / 1024 / 1024 / 1024:.2f} GB"
 
 
-def _scan_downloads() -> list[tuple[Path, int, datetime]]:
-    """Return (path, size_bytes, mtime) for every regular file under output_dir(),
-    newest first. Hidden files and `.part` (in-flight downloads) are skipped."""
-    rows: list[tuple[Path, int, datetime]] = []
-    root = output_dir()
+def _format_duration_seconds(s: float | None) -> str | None:
+    if s is None or s <= 0:
+        return None
+    if s < 60:
+        return f"{int(round(s))}s"
+    mins, secs = divmod(int(round(s)), 60)
+    return f"{mins}m {secs:02d}s"
+
+
+def _model_display_name(task_type: str) -> str:
     try:
-        for entry in root.iterdir():
-            if not entry.is_file():
-                continue
-            if entry.name.startswith(".") or entry.suffix == ".part":
-                continue
+        return by_task_type(task_type).display_name
+    except KeyError:
+        return task_type
+
+
+# ── filesystem scan ───────────────────────────────────────────────────
+
+
+def _scan_downloads_grouped() -> tuple[list[tuple[str, list[FileEntry]]], list[FileEntry]]:
+    """Walk the downloads/ tree once.
+
+    Returns:
+        folders : list of (top_level_folder_name, list_of_FileEntry)
+                  inner list sorted newest-first; outer list sorted by
+                  newest contained mtime, newest folders first.
+        loose   : list of FileEntry for files directly inside downloads/,
+                  newest first.
+    """
+    root = output_dir()
+    folders_map: dict[str, list[FileEntry]] = {}
+    loose: list[FileEntry] = []
+
+    def _visit_dir(folder_name: str, dir_path: Path) -> None:
+        bucket = folders_map.setdefault(folder_name, [])
+        for sub in dir_path.iterdir():
             try:
-                st = entry.stat()
+                if sub.is_file():
+                    if sub.name.startswith(".") or sub.suffix == ".part":
+                        continue
+                    st = sub.stat()
+                    rel = sub.relative_to(root).as_posix()
+                    bucket.append(FileEntry(
+                        path=sub, rel_path=rel,
+                        size=st.st_size,
+                        mtime=datetime.fromtimestamp(st.st_mtime),
+                    ))
+                elif sub.is_dir() and not sub.name.startswith("."):
+                    _visit_dir(folder_name, sub)
             except OSError:
                 continue
-            rows.append((entry, st.st_size, datetime.fromtimestamp(st.st_mtime)))
+
+    try:
+        for entry in root.iterdir():
+            if entry.is_file():
+                if entry.name.startswith(".") or entry.suffix == ".part":
+                    continue
+                try:
+                    st = entry.stat()
+                except OSError:
+                    continue
+                loose.append(FileEntry(
+                    path=entry, rel_path=entry.name,
+                    size=st.st_size,
+                    mtime=datetime.fromtimestamp(st.st_mtime),
+                ))
+            elif entry.is_dir() and not entry.name.startswith("."):
+                _visit_dir(entry.name, entry)
     except FileNotFoundError:
-        return []
-    rows.sort(key=lambda r: r[2], reverse=True)
-    return rows
+        return [], []
+
+    # Sort inside each folder: newest first
+    for files in folders_map.values():
+        files.sort(key=lambda f: f.mtime, reverse=True)
+
+    # Sort folder list by newest contained file
+    folders = sorted(
+        ((name, files) for name, files in folders_map.items() if files),
+        key=lambda kv: kv[1][0].mtime,
+        reverse=True,
+    )
+    loose.sort(key=lambda f: f.mtime, reverse=True)
+    return folders, loose
 
 
-def _row_for(page: ft.Page, path: Path, size: int, mtime: datetime) -> ft.Control:
-    # In web mode the file is served via /downloads/<name>; in desktop mode the
-    # row is informational only (no static server in front of it).
-    url = f"/downloads/{quote(path.name)}" if is_web_mode() else None
+# ── thumbnail URL / placeholder ──────────────────────────────────────
+
+
+_THUMB_W = 128
+_THUMB_H = 72
+_FOLDER_THUMB_W = 180
+_FOLDER_THUMB_H = 100
+
+
+def _placeholder(width: int, height: int, icon: str = ft.Icons.MOVIE_OUTLINED) -> ft.Control:
+    return ft.Container(
+        content=ft.Icon(icon, size=28, color=theme.Colors.text_dim),
+        alignment=ft.alignment.center,
+        bgcolor=theme.Colors.surface_3,
+        border_radius=6,
+        width=width,
+        height=height,
+    )
+
+
+def _thumb_image(rel_path: str, width: int, height: int) -> ft.Control:
+    """Image control showing /thumbs/<rel_path>.jpg, or a placeholder.
+
+    In desktop mode there's no FastAPI server, so always show a placeholder.
+    """
+    if not is_web_mode():
+        return _placeholder(width, height)
+    # urlquote keeps "/" by default — multi-segment subpaths work as-is
+    thumb_url = f"/thumbs/{quote(rel_path)}.jpg"
+    return ft.Image(
+        src=thumb_url,
+        width=width,
+        height=height,
+        fit=ft.ImageFit.COVER,
+        border_radius=6,
+        error_content=_placeholder(width, height),
+    )
+
+
+# ── rows ──────────────────────────────────────────────────────────────
+
+
+def _file_row(
+    page: ft.Page,
+    entry: FileEntry,
+    job: Job | None,
+) -> ft.Control:
+    url = f"/downloads/{quote(entry.rel_path)}" if is_web_mode() else None
 
     def do_download(_: ft.ControlEvent) -> None:
         if url:
             page.launch_url(url)
 
+    title = (job.name if (job and job.name) else entry.path.name).strip() or entry.path.name
+    subtitle_parts: list[str] = [
+        _format_bytes(entry.size),
+        entry.mtime.strftime("%Y-%m-%d %H:%M"),
+    ]
+    if job is not None:
+        subtitle_parts.append(_model_display_name(job.model_task_type))
+        gen = _format_duration_seconds(job.generation_seconds)
+        if gen is not None:
+            subtitle_parts.append(f"⏱ {gen}")
+
     return ft.Container(
         content=ft.Row(
             [
-                ft.Icon(ft.Icons.MOVIE_OUTLINED, size=18, color=theme.Colors.text_secondary),
+                _thumb_image(entry.rel_path, _THUMB_W, _THUMB_H),
                 ft.Column(
                     [
                         ft.Text(
-                            path.name,
+                            title,
                             size=13,
                             color=theme.Colors.text_primary,
                             no_wrap=True,
                             overflow=ft.TextOverflow.ELLIPSIS,
                             selectable=True,
+                            weight=ft.FontWeight.W_500,
                         ),
                         ft.Text(
-                            f"{_format_bytes(size)}  •  {mtime.strftime('%Y-%m-%d %H:%M')}",
+                            entry.path.name,
                             size=11,
                             color=theme.Colors.text_dim,
+                            no_wrap=True,
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                            selectable=True,
+                        ),
+                        ft.Text(
+                            "  •  ".join(subtitle_parts),
+                            size=11,
+                            color=theme.Colors.text_secondary,
                         ),
                     ],
                     spacing=2,
@@ -91,7 +246,7 @@ def _row_for(page: ft.Page, path: Path, size: int, mtime: datetime) -> ft.Contro
                     ),
                 ),
             ],
-            spacing=12,
+            spacing=14,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         ),
         bgcolor=theme.Colors.surface_2,
@@ -101,10 +256,106 @@ def _row_for(page: ft.Page, path: Path, size: int, mtime: datetime) -> ft.Contro
     )
 
 
-def build_downloads_view(page: ft.Page, state: AppState) -> ft.View:
-    list_column = ft.Column(spacing=6, scroll=ft.ScrollMode.AUTO, expand=True)
+def _folder_card(
+    folder_name: str,
+    files: list[FileEntry],
+    on_open,
+) -> ft.Control:
+    # "First video" = chronologically earliest by mtime → last after desc sort
+    preview = files[-1]
+    total_size = sum(f.size for f in files)
+    latest = files[0].mtime
+    n = len(files)
 
-    empty_state = ft.Container(
+    return ft.Container(
+        content=ft.Row(
+            [
+                _thumb_image(preview.rel_path, _FOLDER_THUMB_W, _FOLDER_THUMB_H),
+                ft.Column(
+                    [
+                        ft.Row(
+                            [
+                                ft.Icon(ft.Icons.FOLDER_ROUNDED, size=18, color=theme.Colors.primary),
+                                ft.Text(
+                                    folder_name,
+                                    size=14,
+                                    weight=ft.FontWeight.W_600,
+                                    color=theme.Colors.text_primary,
+                                    no_wrap=True,
+                                    overflow=ft.TextOverflow.ELLIPSIS,
+                                    selectable=True,
+                                ),
+                            ],
+                            spacing=6,
+                        ),
+                        ft.Text(
+                            f"{n} video{'s' if n != 1 else ''}  •  "
+                            f"{_format_bytes(total_size)}  •  "
+                            f"latest {latest.strftime('%Y-%m-%d %H:%M')}",
+                            size=12,
+                            color=theme.Colors.text_secondary,
+                        ),
+                    ],
+                    spacing=4,
+                    expand=True,
+                    tight=True,
+                ),
+                ft.Icon(
+                    ft.Icons.CHEVRON_RIGHT_ROUNDED,
+                    size=24,
+                    color=theme.Colors.text_dim,
+                ),
+            ],
+            spacing=14,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
+        bgcolor=theme.Colors.surface_2,
+        border_radius=10,
+        border=ft.border.all(1, theme.Colors.border),
+        padding=ft.padding.symmetric(horizontal=14, vertical=12),
+        ink=True,
+        on_click=lambda _e: on_open(folder_name),
+    )
+
+
+def _breadcrumb(folder_name: str, on_back) -> ft.Control:
+    return ft.Container(
+        content=ft.Row(
+            [
+                ft.TextButton(
+                    text="All folders",
+                    icon=ft.Icons.ARROW_BACK_ROUNDED,
+                    on_click=lambda _e: on_back(),
+                    style=ft.ButtonStyle(
+                        color={"": theme.Colors.text_secondary},
+                        shape=ft.RoundedRectangleBorder(radius=6),
+                    ),
+                ),
+                ft.Icon(ft.Icons.CHEVRON_RIGHT_ROUNDED, size=18, color=theme.Colors.text_dim),
+                ft.Icon(ft.Icons.FOLDER_ROUNDED, size=16, color=theme.Colors.primary),
+                ft.Text(
+                    folder_name,
+                    size=14,
+                    weight=ft.FontWeight.W_600,
+                    color=theme.Colors.text_primary,
+                    selectable=True,
+                ),
+            ],
+            spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
+        padding=ft.padding.only(left=4, right=4, top=2, bottom=8),
+    )
+
+
+# ── view ──────────────────────────────────────────────────────────────
+
+
+def build_downloads_view(page: ft.Page, state: AppState) -> ft.View:
+    list_column = ft.Column(spacing=8, scroll=ft.ScrollMode.AUTO, expand=True)
+    current_folder: dict[str, str | None] = {"name": None}  # None = root view
+
+    empty_state_root = ft.Container(
         content=ft.Column(
             [
                 ft.Icon(ft.Icons.FOLDER_OFF, size=48, color=theme.Colors.text_dim),
@@ -122,26 +373,70 @@ def build_downloads_view(page: ft.Page, state: AppState) -> ft.View:
         expand=True,
     )
 
-    def reload() -> None:
+    empty_state_folder = ft.Container(
+        content=ft.Text("Folder is empty.", size=12, color=theme.Colors.text_dim),
+        alignment=ft.alignment.center,
+        padding=ft.padding.symmetric(vertical=40),
+    )
+
+    async def reload() -> None:
         try:
-            rows = _scan_downloads()
+            folders, loose = _scan_downloads_grouped()
         except Exception as e:  # noqa: BLE001
             logger.warning("scan downloads failed: {}", e)
-            rows = []
-        if not rows:
-            list_column.controls = [empty_state]
+            folders, loose = [], []
+
+        jobs_by_filename: dict[str, Job] = {}
+        try:
+            jobs = await list_recent_jobs(limit=1000)
+            for j in jobs:
+                if j.output_path:
+                    jobs_by_filename.setdefault(Path(j.output_path).name, j)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("load jobs for /downloads failed: {}", e)
+
+        controls: list[ft.Control] = []
+        cur = current_folder["name"]
+
+        if cur is None:
+            for fname, files in folders:
+                controls.append(_folder_card(fname, files, enter_folder))
+            for entry in loose:
+                controls.append(_file_row(page, entry, jobs_by_filename.get(entry.path.name)))
+            if not controls:
+                controls.append(empty_state_root)
         else:
-            list_column.controls = [_row_for(page, p, s, m) for p, s, m in rows]
+            matched = next((files for n, files in folders if n == cur), None)
+            controls.append(_breadcrumb(cur, back_to_root))
+            if not matched:
+                controls.append(empty_state_folder)
+            else:
+                for entry in matched:
+                    controls.append(_file_row(page, entry, jobs_by_filename.get(entry.path.name)))
+
+        list_column.controls = controls
         try:
             list_column.update()
         except Exception:
             pass
 
+    def enter_folder(name: str) -> None:
+        current_folder["name"] = name
+        page.run_task(reload)
+
+    def back_to_root() -> None:
+        current_folder["name"] = None
+        page.run_task(reload)
+
     def go_back(_: ft.ControlEvent) -> None:
-        page.go("/jobs")
+        # Top-bar Back button: if inside a folder, go to root; otherwise leave page.
+        if current_folder["name"] is not None:
+            back_to_root()
+        else:
+            page.go("/jobs")
 
     def refresh(_: ft.ControlEvent) -> None:
-        reload()
+        page.run_task(reload)
 
     header = ft.Container(
         content=ft.Row(
@@ -174,7 +469,7 @@ def build_downloads_view(page: ft.Page, state: AppState) -> ft.View:
         expand=True,
     )
 
-    reload()
+    page.run_task(reload)
 
     return ft.View(
         route="/downloads",

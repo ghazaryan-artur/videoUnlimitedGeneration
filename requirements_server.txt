@@ -21,3 +21,7 @@ uvicorn[standard]==0.34.0
 # Browser fallback for login + recorder
 playwright==1.49.1
 playwright-stealth==1.0.6
+
+# Bundled ffmpeg for /downloads thumbnail extraction (app/core/thumbs.py).
+# System ffmpeg is preferred if installed; this wheel is the fallback.
+imageio-ffmpeg==0.5.1

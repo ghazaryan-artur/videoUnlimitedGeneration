@@ -84,6 +84,48 @@ def output_dir() -> Path:
     return videos
 
 
+def resolve_output_dir(user_path: str | None) -> Path:
+    """Resolve a user-supplied destination folder safely.
+
+    In WEB mode, the result is guaranteed to live inside output_dir()
+    (the downloads root). The user's input is treated as a path relative
+    to that root; absolute paths, parent-references (..), and Windows
+    drive letters are stripped before joining, so there is no way to
+    escape upward. An empty/blank input returns the root itself.
+
+    In DESKTOP mode the user's input is used as-is — they own the host
+    and can write wherever they like.
+    """
+    root = output_dir()
+    if not user_path or not user_path.strip():
+        return root
+
+    raw = user_path.strip()
+
+    if not is_web_mode():
+        return Path(raw)
+
+    # Web: keep only "safe" path segments (drop "..", absolute roots,
+    # drive letters), then resolve and double-check containment.
+    parts = []
+    for seg in Path(raw).parts:
+        if seg in ("", "/", "\\", "..", "."):
+            continue
+        # Windows drive letters arrive as "C:\\"; skip them
+        if len(seg) >= 2 and seg[1] == ":":
+            continue
+        parts.append(seg)
+    relative = Path(*parts) if parts else Path()
+
+    candidate = (root / relative).resolve()
+    root_resolved = root.resolve()
+    try:
+        candidate.relative_to(root_resolved)
+    except ValueError:
+        return root_resolved
+    return candidate
+
+
 def browser_profile_dir() -> Path:
     """Persistent Chromium profile for the browser-login fallback."""
     p = user_data_root() / "browser_profile"
