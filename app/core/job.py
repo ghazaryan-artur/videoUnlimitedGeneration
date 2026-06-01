@@ -169,6 +169,14 @@ class PromptDraft(BaseModel):
             return f"{base} #{index + 1}"
         return base
 
+    def clone(self) -> "PromptDraft":
+        """Return an editable copy of this draft with a fresh id.
+
+        Used by the UI "Duplicate" button — same prompt, model, duration,
+        aspect, audio, count, output_dir; new id so it's a distinct draft.
+        """
+        return self.model_copy(update={"id": _new_id()}, deep=True)
+
     def auto_folder(self) -> str:
         """Folder name to group all videos from this draft under, when the
         user didn't specify one explicitly. Prefers the user-set name,

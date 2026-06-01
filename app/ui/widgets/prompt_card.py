@@ -26,11 +26,13 @@ class PromptCard:
         *,
         on_remove: Callable[[PromptDraft], None] | None = None,
         on_request_variations: Callable[[PromptDraft], None] | None = None,
+        on_duplicate: Callable[[PromptDraft], None] | None = None,
     ) -> None:
         self.draft = draft
         self.page = page
         self.on_remove = on_remove
         self.on_request_variations = on_request_variations
+        self.on_duplicate = on_duplicate
 
         # FilePicker — must be added to page.overlay
         self._picker = ft.FilePicker(on_result=self._on_path_picked)
@@ -189,6 +191,20 @@ class PromptCard:
             ),
         )
 
+        copy_prompt_btn = ft.IconButton(
+            icon=ft.Icons.CONTENT_COPY,
+            icon_color=theme.Colors.text_secondary,
+            tooltip="Copy prompt text to clipboard",
+            on_click=self._on_copy_prompt,
+        )
+
+        duplicate_btn = ft.IconButton(
+            icon=ft.Icons.FILE_COPY,
+            icon_color=theme.Colors.text_secondary,
+            tooltip="Duplicate card with the same settings",
+            on_click=lambda _: (self.on_duplicate(self.draft) if self.on_duplicate else None),
+        )
+
         remove_btn = ft.IconButton(
             icon=ft.Icons.CLOSE_ROUNDED,
             icon_color=theme.Colors.text_dim,
@@ -208,6 +224,8 @@ class PromptCard:
             "browse_btn": browse_btn,
             "clear_btn": clear_btn,
             "ai_btn": ai_btn,
+            "copy_prompt_btn": copy_prompt_btn,
+            "duplicate_btn": duplicate_btn,
             "remove_btn": remove_btn,
         }
 
@@ -247,6 +265,8 @@ class PromptCard:
                             ),
                             ft.Container(expand=True),
                             c["ai_btn"],
+                            c["copy_prompt_btn"],
+                            c["duplicate_btn"],
                             c["remove_btn"],
                         ],
                     ),
@@ -344,6 +364,27 @@ class PromptCard:
     def _on_clear_path(self, _: ft.ControlEvent) -> None:
         self.draft.output_dir = None
         self._refresh_path_row()
+
+    def _on_copy_prompt(self, _: ft.ControlEvent) -> None:
+        text = (self.draft.prompt or "").strip()
+        if not text:
+            self.page.snack_bar = ft.SnackBar(
+                ft.Text("Prompt is empty — nothing to copy."),
+                bgcolor=theme.Colors.surface_2,
+            )
+            self.page.snack_bar.open = True
+            self.page.update()
+            return
+        try:
+            self.page.set_clipboard(text)
+        except Exception:
+            pass
+        self.page.snack_bar = ft.SnackBar(
+            ft.Text("Prompt copied to clipboard."),
+            bgcolor=theme.Colors.surface_2,
+        )
+        self.page.snack_bar.open = True
+        self.page.update()
 
     def _refresh_path_row(self) -> None:
         c = self._controls

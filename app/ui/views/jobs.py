@@ -144,6 +144,15 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
             state.drafts.remove(draft)
         rebuild()
 
+    def duplicate_draft(draft: PromptDraft) -> None:
+        copy = draft.clone()
+        try:
+            idx = state.drafts.index(draft)
+            state.drafts.insert(idx + 1, copy)
+        except ValueError:
+            state.drafts.append(copy)
+        rebuild()
+
     # ── AI variations dialog (Claude API) ──────────────────────────
 
     def open_ai_variations_dialog(source_draft: PromptDraft) -> None:
@@ -781,6 +790,7 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
                 d, page,
                 on_remove=remove_draft,
                 on_request_variations=open_ai_variations_dialog,
+                on_duplicate=duplicate_draft,
             )
             prompt_card_index[d.id] = pc
             active_column.controls.append(pc.control)
@@ -1041,7 +1051,10 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
             page.update()
             return
 
-        if state.client is None:
+        # If a transient websocket disconnect nulled the client but the JWT
+        # is still valid, re-hydrate the client instead of bouncing the user
+        # back to /login.
+        if not state.ensure_client():
             page.go("/login")
             return
 
@@ -1430,7 +1443,7 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
     # ── "Check by Task ID" dialog ──────────────────────────────────
 
     async def check_task_by_id(_: ft.ControlEvent) -> None:
-        if state.client is None:
+        if not state.ensure_client():
             page.go("/login")
             return
 
