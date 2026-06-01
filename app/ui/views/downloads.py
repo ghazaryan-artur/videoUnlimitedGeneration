@@ -19,7 +19,7 @@ from urllib.parse import quote
 import flet as ft
 from loguru import logger
 
-from app.core.job import Job
+from app.core.job import Job, PromptDraft
 from app.core.storage import list_recent_jobs
 from app.paths import is_web_mode, output_dir
 from app.runway.models import by_task_type
@@ -182,6 +182,8 @@ def _file_row(
     page: ft.Page,
     entry: FileEntry,
     job: Job | None,
+    on_copy_prompt=None,
+    on_duplicate_as_draft=None,
 ) -> ft.Control:
     url = f"/downloads/{quote(entry.rel_path)}" if is_web_mode() else None
 
@@ -199,6 +201,34 @@ def _file_row(
         gen = _format_duration_seconds(job.generation_seconds)
         if gen is not None:
             subtitle_parts.append(f"⏱ {gen}")
+
+    action_row: list[ft.Control] = []
+    if job is not None and (job.prompt or "").strip() and on_copy_prompt is not None:
+        action_row.append(ft.IconButton(
+            icon=ft.Icons.CONTENT_COPY,
+            icon_color=theme.Colors.text_secondary,
+            tooltip="Copy prompt text to clipboard",
+            on_click=lambda _: on_copy_prompt(job),
+        ))
+    if job is not None and on_duplicate_as_draft is not None:
+        action_row.append(ft.IconButton(
+            icon=ft.Icons.FILE_COPY,
+            icon_color=theme.Colors.text_secondary,
+            tooltip="Duplicate as draft (same settings)",
+            on_click=lambda _: on_duplicate_as_draft(job),
+        ))
+    action_row.append(ft.FilledButton(
+        text="Download",
+        icon=ft.Icons.CLOUD_DOWNLOAD,
+        on_click=do_download,
+        disabled=url is None,
+        tooltip=None if url else "Available only in web mode",
+        style=ft.ButtonStyle(
+            color={"": theme.Colors.bg},
+            bgcolor={"": theme.Colors.state_done},
+            shape=ft.RoundedRectangleBorder(radius=8),
+        ),
+    ))
 
     return ft.Container(
         content=ft.Row(
@@ -233,18 +263,7 @@ def _file_row(
                     expand=True,
                     tight=True,
                 ),
-                ft.FilledButton(
-                    text="Download",
-                    icon=ft.Icons.CLOUD_DOWNLOAD,
-                    on_click=do_download,
-                    disabled=url is None,
-                    tooltip=None if url else "Available only in web mode",
-                    style=ft.ButtonStyle(
-                        color={"": theme.Colors.bg},
-                        bgcolor={"": theme.Colors.state_done},
-                        shape=ft.RoundedRectangleBorder(radius=8),
-                    ),
-                ),
+                *action_row,
             ],
             spacing=14,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -355,6 +374,42 @@ def build_downloads_view(page: ft.Page, state: AppState) -> ft.View:
     list_column = ft.Column(spacing=8, scroll=ft.ScrollMode.AUTO, expand=True)
     current_folder: dict[str, str | None] = {"name": None}  # None = root view
 
+    def _toast(msg: str) -> None:
+        page.snack_bar = ft.SnackBar(
+            ft.Text(msg),
+            bgcolor=theme.Colors.surface_2,
+        )
+        page.snack_bar.open = True
+        page.update()
+
+    def copy_job_prompt(job: Job) -> None:
+        text = (job.prompt or "").strip()
+        if not text:
+            _toast("Prompt is empty — nothing to copy.")
+            return
+        try:
+            page.set_clipboard(text)
+        except Exception:
+            pass
+        _toast("Prompt copied to clipboard.")
+
+    def duplicate_job_as_draft(job: Job) -> None:
+        bare_name = (job.name or "").split(" #")[0].strip() or None
+        new_draft = PromptDraft(
+            prompt=job.prompt,
+            model_task_type=job.model_task_type,
+            duration=job.duration,
+            aspect_ratio=job.aspect_ratio,
+            resolution=job.resolution,
+            audio=job.audio,
+            name=bare_name,
+            output_dir=job.output_dir,
+            count=1,
+        )
+        state.drafts.append(new_draft)
+        _toast("Draft added — taking you to Jobs.")
+        page.go("/jobs")
+
     empty_state_root = ft.Container(
         content=ft.Column(
             [
@@ -402,7 +457,11 @@ def build_downloads_view(page: ft.Page, state: AppState) -> ft.View:
             for fname, files in folders:
                 controls.append(_folder_card(fname, files, enter_folder))
             for entry in loose:
-                controls.append(_file_row(page, entry, jobs_by_filename.get(entry.path.name)))
+                controls.append(_file_row(
+                    page, entry, jobs_by_filename.get(entry.path.name),
+                    on_copy_prompt=copy_job_prompt,
+                    on_duplicate_as_draft=duplicate_job_as_draft,
+                ))
             if not controls:
                 controls.append(empty_state_root)
         else:
@@ -412,7 +471,11 @@ def build_downloads_view(page: ft.Page, state: AppState) -> ft.View:
                 controls.append(empty_state_folder)
             else:
                 for entry in matched:
-                    controls.append(_file_row(page, entry, jobs_by_filename.get(entry.path.name)))
+                    controls.append(_file_row(
+                    page, entry, jobs_by_filename.get(entry.path.name),
+                    on_copy_prompt=copy_job_prompt,
+                    on_duplicate_as_draft=duplicate_job_as_draft,
+                ))
 
         list_column.controls = controls
         try:

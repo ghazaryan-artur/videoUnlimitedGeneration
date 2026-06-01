@@ -88,12 +88,16 @@ class JobCard:
         on_open_folder: Callable[[Job], None] | None = None,
         on_retry: Callable[[Job], None] | None = None,
         on_cancel: Callable[[Job], None] | None = None,
+        on_copy_prompt: Callable[[Job], None] | None = None,
+        on_duplicate_as_draft: Callable[[Job], None] | None = None,
     ) -> None:
         self.job = job
         self.page = page
         self.on_open_folder = on_open_folder
         self.on_retry = on_retry
         self.on_cancel = on_cancel
+        self.on_copy_prompt = on_copy_prompt
+        self.on_duplicate_as_draft = on_duplicate_as_draft
 
         self.root = ft.Container(content=self._render(), animate=ft.Animation(150, "easeOut"))
 
@@ -356,6 +360,24 @@ class JobCard:
                     icon_color=theme.Colors.text_dim,
                     tooltip="Cancel this job",
                     on_click=lambda _: self.on_cancel(self.job),
+                )
+            )
+        if self.on_copy_prompt is not None and (self.job.prompt or "").strip():
+            buttons.append(
+                ft.IconButton(
+                    icon=ft.Icons.CONTENT_COPY,
+                    icon_color=theme.Colors.text_secondary,
+                    tooltip="Copy prompt text to clipboard",
+                    on_click=lambda _: self.on_copy_prompt(self.job),
+                )
+            )
+        if self.on_duplicate_as_draft is not None:
+            buttons.append(
+                ft.IconButton(
+                    icon=ft.Icons.FILE_COPY,
+                    icon_color=theme.Colors.text_secondary,
+                    tooltip="Duplicate as draft (same settings)",
+                    on_click=lambda _: self.on_duplicate_as_draft(self.job),
                 )
             )
         return buttons

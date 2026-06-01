@@ -153,6 +153,56 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
             state.drafts.append(copy)
         rebuild()
 
+    def _toast(msg: str) -> None:
+        page.snack_bar = ft.SnackBar(
+            ft.Text(msg),
+            bgcolor=theme.Colors.surface_2,
+        )
+        page.snack_bar.open = True
+        page.update()
+
+    def copy_job_prompt(job: Job) -> None:
+        text = (job.prompt or "").strip()
+        if not text:
+            _toast("Prompt is empty — nothing to copy.")
+            return
+        try:
+            page.set_clipboard(text)
+        except Exception:
+            pass
+        _toast("Prompt copied to clipboard.")
+
+    def duplicate_job_as_draft(job: Job) -> None:
+        """Turn a completed/active/failed job back into an editable draft.
+
+        Same prompt + model + duration + aspect + resolution + audio +
+        output_dir. count is reset to 1 (each Job already represents one
+        rendered video; the per-card #N suffix is stripped from name).
+        """
+        bare_name = (job.name or "").split(" #")[0].strip() or None
+        new_draft = PromptDraft(
+            prompt=job.prompt,
+            model_task_type=job.model_task_type,
+            duration=job.duration,
+            aspect_ratio=job.aspect_ratio,
+            resolution=job.resolution,
+            audio=job.audio,
+            name=bare_name,
+            output_dir=job.output_dir,
+            count=1,
+        )
+        state.drafts.append(new_draft)
+        # Jump to the Active tab so the user immediately sees the new draft —
+        # matches the behaviour of the same button on the /downloads page,
+        # which routes back to /jobs.
+        try:
+            tabs.selected_index = 0
+            tabs.update()
+        except Exception:
+            pass
+        rebuild()
+        _toast("Card duplicated — your new draft is at the bottom of Active.")
+
     # ── AI variations dialog (Claude API) ──────────────────────────
 
     def open_ai_variations_dialog(source_draft: PromptDraft) -> None:
@@ -781,7 +831,13 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
             key=lambda j: j.created_at,
         )
         for j in active_jobs_sorted:
-            card = JobCard(j, page, on_open_folder=open_for_job, on_cancel=cancel_one_job)
+            card = JobCard(
+                j, page,
+                on_open_folder=open_for_job,
+                on_cancel=cancel_one_job,
+                on_copy_prompt=copy_job_prompt,
+                on_duplicate_as_draft=duplicate_job_as_draft,
+            )
             job_card_index[j.id] = card
             active_column.controls.append(card.control)
 
@@ -818,7 +874,12 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
         merged.sort(key=lambda j: j.created_at, reverse=True)
 
         for j in merged:
-            card = JobCard(j, page, on_open_folder=open_for_job)
+            card = JobCard(
+                j, page,
+                on_open_folder=open_for_job,
+                on_copy_prompt=copy_job_prompt,
+                on_duplicate_as_draft=duplicate_job_as_draft,
+            )
             job_card_index[j.id] = card
             completed_column.controls.append(card.control)
 
