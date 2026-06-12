@@ -19,7 +19,7 @@ from urllib.parse import quote
 import flet as ft
 from loguru import logger
 
-from app.core.job import Job, PromptDraft
+from app.core.job import Job, PromptDraft, safe_folder_name
 from app.core.storage import list_recent_jobs
 from app.paths import is_web_mode, output_dir
 from app.runway.models import by_task_type
@@ -70,17 +70,30 @@ def _model_display_name(task_type: str) -> str:
 # ── filesystem scan ───────────────────────────────────────────────────
 
 
-def _scan_downloads_grouped() -> tuple[list[tuple[str, list[FileEntry]]], list[FileEntry]]:
-    """Walk the downloads/ tree once.
+def _scan_downloads_grouped(
+    *, relative_root: str | None = None,
+) -> tuple[list[tuple[str, list[FileEntry]]], list[FileEntry]]:
+    """Walk a single level under downloads/<relative_root>/.
+
+    When `relative_root` is None the scan starts from downloads/ itself
+    (legacy behaviour). When given, we descend into downloads/<relative_root>/
+    and group its immediate subdirectories — so for an author named "Anna"
+    the view at /downloads shows her subfolders (cats, dogs, …) directly,
+    without a useless "Anna" wrapper card.
+
+    rel_path on every FileEntry is always anchored at downloads/ (the path
+    served by the /downloads/<rel> static route), so URLs and thumbnails
+    keep working regardless of the scan root.
 
     Returns:
-        folders : list of (top_level_folder_name, list_of_FileEntry)
+        folders : list of (subfolder_name, list_of_FileEntry)
                   inner list sorted newest-first; outer list sorted by
                   newest contained mtime, newest folders first.
-        loose   : list of FileEntry for files directly inside downloads/,
-                  newest first.
+        loose   : list of FileEntry for files directly inside the scan
+                  root (no further nesting), newest first.
     """
     root = output_dir()
+    base = root if relative_root is None else (root / relative_root)
     folders_map: dict[str, list[FileEntry]] = {}
     loose: list[FileEntry] = []
 
@@ -104,7 +117,7 @@ def _scan_downloads_grouped() -> tuple[list[tuple[str, list[FileEntry]]], list[F
                 continue
 
     try:
-        for entry in root.iterdir():
+        for entry in base.iterdir():
             if entry.is_file():
                 if entry.name.startswith(".") or entry.suffix == ".part":
                     continue
@@ -112,8 +125,9 @@ def _scan_downloads_grouped() -> tuple[list[tuple[str, list[FileEntry]]], list[F
                     st = entry.stat()
                 except OSError:
                     continue
+                rel = entry.relative_to(root).as_posix()
                 loose.append(FileEntry(
-                    path=entry, rel_path=entry.name,
+                    path=entry, rel_path=rel,
                     size=st.st_size,
                     mtime=datetime.fromtimestamp(st.st_mtime),
                 ))
@@ -184,6 +198,7 @@ def _file_row(
     job: Job | None,
     on_copy_prompt=None,
     on_duplicate_as_draft=None,
+    on_delete=None,
 ) -> ft.Control:
     url = f"/downloads/{quote(entry.rel_path)}" if is_web_mode() else None
 
@@ -229,6 +244,13 @@ def _file_row(
             shape=ft.RoundedRectangleBorder(radius=8),
         ),
     ))
+    if on_delete is not None:
+        action_row.append(ft.IconButton(
+            icon=ft.Icons.DELETE_OUTLINE,
+            icon_color=theme.Colors.state_failed,
+            tooltip="Delete video (file + DB record)",
+            on_click=lambda _: on_delete(entry, job),
+        ))
 
     return ft.Container(
         content=ft.Row(
@@ -279,12 +301,43 @@ def _folder_card(
     folder_name: str,
     files: list[FileEntry],
     on_open,
+    *,
+    page: ft.Page | None = None,
+    folder_rel: str | None = None,
 ) -> ft.Control:
     # "First video" = chronologically earliest by mtime → last after desc sort
     preview = files[-1]
     total_size = sum(f.size for f in files)
     latest = files[0].mtime
     n = len(files)
+
+    # "Download all" — only meaningful in web mode and when we know which
+    # folder to bundle. Clicking the button must NOT also enter the folder
+    # (event bubbling), so we wrap it in a GestureDetector / contain it as
+    # a separate Container with its own on_click and stop propagation by
+    # leaving the outer Container without on_click on this child path.
+    right_controls: list[ft.Control] = []
+    if page is not None and folder_rel and is_web_mode():
+        zip_url = f"/downloads-zip/{quote(folder_rel)}/"
+
+        def _download_all(_e: ft.ControlEvent) -> None:
+            page.launch_url(zip_url)
+
+        right_controls.append(
+            ft.IconButton(
+                icon=ft.Icons.DOWNLOAD_FOR_OFFLINE,
+                icon_color=theme.Colors.state_done,
+                tooltip=f"Download all {n} as zip",
+                on_click=_download_all,
+            )
+        )
+    right_controls.append(
+        ft.Icon(
+            ft.Icons.CHEVRON_RIGHT_ROUNDED,
+            size=24,
+            color=theme.Colors.text_dim,
+        )
+    )
 
     return ft.Container(
         content=ft.Row(
@@ -319,11 +372,7 @@ def _folder_card(
                     expand=True,
                     tight=True,
                 ),
-                ft.Icon(
-                    ft.Icons.CHEVRON_RIGHT_ROUNDED,
-                    size=24,
-                    color=theme.Colors.text_dim,
-                ),
+                *right_controls,
             ],
             spacing=14,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -410,6 +459,100 @@ def build_downloads_view(page: ft.Page, state: AppState) -> ft.View:
         _toast("Draft added — taking you to Jobs.")
         page.go("/jobs")
 
+    def confirm_delete(entry: FileEntry, job: Job | None) -> None:
+        """Two-step delete: confirm, then unlink the file and drop the
+        matching DB row (so it disappears from History too).
+
+        The thumbnail cache file (if any) is also removed — otherwise the
+        next scan would still pick up a stale .thumbs/<filename>.jpg.
+        """
+        async def _do_delete() -> None:
+            from app.core import storage
+            # File first; if anything below errors out we still want the
+            # video gone from disk (the visible part for the user).
+            try:
+                entry.path.unlink(missing_ok=True)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("delete file failed {}: {}", entry.path, e)
+                _toast(f"Could not delete file: {e}")
+                return
+            # Thumbnail cache (best-effort)
+            try:
+                thumb = output_dir() / ".thumbs" / (entry.path.name + ".jpg")
+                thumb.unlink(missing_ok=True)
+            except Exception:
+                pass
+            # DB row — only if we have a job for this file
+            if job is not None:
+                try:
+                    await storage.delete_job(job.id)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("delete_job {} failed: {}", job.id, e)
+            page.close(dialog)
+            _toast("Video deleted.")
+            await reload()
+
+        def _on_confirm(_e: ft.ControlEvent) -> None:
+            page.run_task(_do_delete)
+
+        title_text = (job.name if (job and job.name) else entry.path.name).strip() \
+            or entry.path.name
+        dialog = ft.AlertDialog(
+            modal=True,
+            bgcolor=theme.Colors.surface,
+            title=ft.Row(
+                [
+                    ft.Icon(ft.Icons.DELETE_FOREVER, color=theme.Colors.state_failed, size=22),
+                    ft.Text(
+                        "Delete video?",
+                        color=theme.Colors.text_primary,
+                        size=16, weight=ft.FontWeight.W_600,
+                    ),
+                ],
+                spacing=8,
+            ),
+            content=ft.Container(
+                width=440,
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            title_text,
+                            size=13,
+                            color=theme.Colors.text_primary,
+                            weight=ft.FontWeight.W_500,
+                            selectable=True,
+                        ),
+                        ft.Container(height=6),
+                        ft.Text(
+                            "The file will be removed from disk and the matching "
+                            "record from the database. This cannot be undone.",
+                            size=12, color=theme.Colors.text_dim,
+                        ),
+                    ],
+                    spacing=0, tight=True,
+                ),
+            ),
+            actions=[
+                ft.Row(
+                    [
+                        theme.secondary_button("Cancel", on_click=lambda _e: page.close(dialog)),
+                        ft.FilledButton(
+                            text="Delete",
+                            icon=ft.Icons.DELETE_OUTLINE,
+                            on_click=_on_confirm,
+                            style=ft.ButtonStyle(
+                                color={"": theme.Colors.bg},
+                                bgcolor={"": theme.Colors.state_failed},
+                                shape=ft.RoundedRectangleBorder(radius=8),
+                            ),
+                        ),
+                    ],
+                    spacing=4,
+                ),
+            ],
+        )
+        page.open(dialog)
+
     empty_state_root = ft.Container(
         content=ft.Column(
             [
@@ -435,11 +578,21 @@ def build_downloads_view(page: ft.Page, state: AppState) -> ft.View:
     )
 
     async def reload() -> None:
-        try:
-            folders, loose = _scan_downloads_grouped()
-        except Exception as e:  # noqa: BLE001
-            logger.warning("scan downloads failed: {}", e)
-            folders, loose = [], []
+        # Mine-only Downloads: scan directly inside downloads/<author>/, so
+        # the root view shows that author's subfolders (cats, dogs, …)
+        # without an extra "Anna" wrapper card. Without a selected author
+        # nothing is shown — Active is shared, Downloads is per-author.
+        if not state.selected_author:
+            folders: list[tuple[str, list[FileEntry]]] = []
+            loose: list[FileEntry] = []
+            author_seg: str | None = None
+        else:
+            author_seg = safe_folder_name(state.selected_author)
+            try:
+                folders, loose = _scan_downloads_grouped(relative_root=author_seg)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("scan downloads failed: {}", e)
+                folders, loose = [], []
 
         jobs_by_filename: dict[str, Job] = {}
         try:
@@ -455,12 +608,17 @@ def build_downloads_view(page: ft.Page, state: AppState) -> ft.View:
 
         if cur is None:
             for fname, files in folders:
-                controls.append(_folder_card(fname, files, enter_folder))
+                folder_rel = f"{author_seg}/{fname}" if author_seg else fname
+                controls.append(_folder_card(
+                    fname, files, enter_folder,
+                    page=page, folder_rel=folder_rel,
+                ))
             for entry in loose:
                 controls.append(_file_row(
                     page, entry, jobs_by_filename.get(entry.path.name),
                     on_copy_prompt=copy_job_prompt,
                     on_duplicate_as_draft=duplicate_job_as_draft,
+                    on_delete=confirm_delete,
                 ))
             if not controls:
                 controls.append(empty_state_root)
@@ -475,6 +633,7 @@ def build_downloads_view(page: ft.Page, state: AppState) -> ft.View:
                     page, entry, jobs_by_filename.get(entry.path.name),
                     on_copy_prompt=copy_job_prompt,
                     on_duplicate_as_draft=duplicate_job_as_draft,
+                    on_delete=confirm_delete,
                 ))
 
         list_column.controls = controls

@@ -6,18 +6,27 @@ the `/downloads/<filename>` route streams finished mp4s with
 instead of playing the video inline. Everything else falls through to Flet.
 
 One process, one port — no nginx, no env vars, no extra system services.
+
+The FastAPI lifespan also brings up `app.core.runtime` once at process
+start, so the BatchRunner + RunwayClient + active-jobs map live for the
+whole process — not just for the duration of a single browser session.
 """
 from __future__ import annotations
 
+import tempfile
+import zipfile
+from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Callable
 
 import flet as ft
 import flet.fastapi as flet_fastapi
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 from loguru import logger
 
+from app.core.runtime import runtime
 from app.paths import output_dir
 
 
@@ -55,8 +64,81 @@ def _safe_download_path(rel_path: str):
     return path
 
 
+def _safe_directory_path(rel_path: str) -> Path:
+    """Same checks as _safe_download_path but resolves to a directory.
+
+    Used by the /downloads-zip/<rel>/ endpoint to bundle a whole folder.
+    """
+    if not rel_path:
+        raise HTTPException(status_code=400, detail="bad path")
+    if any(c in rel_path for c in ("\\", "\x00")):
+        raise HTTPException(status_code=400, detail="bad path")
+
+    segments = [s for s in rel_path.split("/") if s]
+    if not segments:
+        raise HTTPException(status_code=400, detail="bad path")
+    for seg in segments:
+        if seg in (".", "..") or seg.startswith("."):
+            raise HTTPException(status_code=400, detail="bad path")
+
+    root = output_dir().resolve()
+    path = root.joinpath(*segments).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bad path") from None
+    if not path.is_dir():
+        raise HTTPException(status_code=404, detail="folder not found")
+    return path
+
+
+def _build_folder_zip(folder: Path) -> Path:
+    """Bundle every (non-hidden, non-.part) file under `folder` into a new
+    temp .zip and return its path.
+
+    Stored without compression (ZIP_STORED) — mp4s are already compressed,
+    so deflate would burn CPU for no size win. arcname is relative to
+    `folder`, so a download of downloads/Anna/cats/ produces a zip whose
+    top-level contains cats/ contents (no Anna/ prefix in the archive).
+    Caller is responsible for unlinking the returned file.
+    """
+    fd, tmp_name = tempfile.mkstemp(suffix=".zip", prefix="runway_bundle_")
+    import os
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_STORED) as zf:
+            for sub in sorted(folder.rglob("*")):
+                if not sub.is_file():
+                    continue
+                if sub.name.startswith(".") or sub.suffix == ".part":
+                    continue
+                if any(p.startswith(".") for p in sub.relative_to(folder).parts):
+                    continue
+                zf.write(sub, arcname=sub.relative_to(folder).as_posix())
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return tmp_path
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    """Process-level startup / shutdown for the shared runtime.
+
+    On startup: load the stored JWT (if any), build the BatchRunner and
+    HTTP client, resume unfinished jobs from the DB. On shutdown: close
+    the runner + client cleanly.
+    """
+    await runtime.startup()
+    try:
+        yield
+    finally:
+        await runtime.shutdown()
+
+
 def build_app(target: SessionHandler) -> FastAPI:
-    api = FastAPI(title="RunwayAutomation")
+    api = FastAPI(title="RunwayAutomation", lifespan=_lifespan)
 
     @api.middleware("http")
     async def downloads_intercept(request: Request, call_next):
@@ -69,6 +151,39 @@ def build_app(target: SessionHandler) -> FastAPI:
         so this short-circuits the request before Flet sees it.
         """
         path = request.url.path
+        if path.startswith("/downloads-zip/") and len(path) > len("/downloads-zip/"):
+            # Bundle an entire folder into a zip. Used by the "Download all"
+            # button on a folder card. We use a temp file (not in-memory) so
+            # large bundles don't pin the whole archive in RAM, and clean
+            # it up via a background task after the response finishes.
+            rel = path[len("/downloads-zip/"):].rstrip("/")
+            try:
+                folder = _safe_directory_path(rel)
+            except HTTPException as e:
+                return PlainTextResponse(
+                    str(e.detail or ""), status_code=e.status_code,
+                )
+            try:
+                zip_path = _build_folder_zip(folder)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("zip build failed for {}: {}", folder, e)
+                return PlainTextResponse(
+                    "could not build archive", status_code=500,
+                )
+            from starlette.background import BackgroundTask
+
+            def _cleanup(p: Path) -> None:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            return FileResponse(
+                zip_path,
+                media_type="application/zip",
+                filename=f"{folder.name}.zip",
+                background=BackgroundTask(_cleanup, zip_path),
+            )
         if path.startswith("/downloads/") and len(path) > len("/downloads/"):
             # ASGI scope path is already URL-decoded by Starlette, so spaces
             # arrive as ' ' (not %20).

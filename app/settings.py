@@ -25,6 +25,14 @@ class Settings(BaseSettings):
     # Concurrency
     max_concurrent_jobs: int = 2
 
+    # Random pause a worker takes after finishing one job and before pulling
+    # the next from the queue — gives the run more human-like cadence and
+    # eases pressure on Runway. Each worker rolls a fresh value in this
+    # inclusive range. Set max to 0 to disable. Overridable via
+    # RUNWAY_POST_JOB_PAUSE_MIN_SECONDS / RUNWAY_POST_JOB_PAUSE_MAX_SECONDS.
+    post_job_pause_min_seconds: float = 30.0
+    post_job_pause_max_seconds: float = 60.0
+
     # Logging / retention — keep api_log lean (it bloats fast from polling)
     api_log_retention_days: int = 3
 

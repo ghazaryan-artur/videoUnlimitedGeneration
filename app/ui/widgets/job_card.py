@@ -90,6 +90,8 @@ class JobCard:
         on_cancel: Callable[[Job], None] | None = None,
         on_copy_prompt: Callable[[Job], None] | None = None,
         on_duplicate_as_draft: Callable[[Job], None] | None = None,
+        on_move_up: Callable[[Job], None] | None = None,
+        on_move_down: Callable[[Job], None] | None = None,
     ) -> None:
         self.job = job
         self.page = page
@@ -98,6 +100,11 @@ class JobCard:
         self.on_cancel = on_cancel
         self.on_copy_prompt = on_copy_prompt
         self.on_duplicate_as_draft = on_duplicate_as_draft
+        # Only set on PENDING cards that actually have a neighbour in the
+        # given direction — the view passes None for edges, which hides the
+        # corresponding button.
+        self.on_move_up = on_move_up
+        self.on_move_down = on_move_down
 
         self.root = ft.Container(content=self._render(), animate=ft.Animation(150, "easeOut"))
 
@@ -335,6 +342,28 @@ class JobCard:
 
     def _action_buttons(self) -> list[ft.Control]:
         buttons: list[ft.Control] = []
+        # Reorder controls — only shown on PENDING cards. The view sets the
+        # callback to None when there is no neighbour in that direction
+        # (top/bottom of the pending list), so each button appears only when
+        # it would actually do something.
+        if self.job.status == JobStatus.PENDING and self.on_move_up is not None:
+            buttons.append(
+                ft.IconButton(
+                    icon=ft.Icons.KEYBOARD_ARROW_UP,
+                    icon_color=theme.Colors.text_secondary,
+                    tooltip="Move up in the queue",
+                    on_click=lambda _: self.on_move_up(self.job),
+                )
+            )
+        if self.job.status == JobStatus.PENDING and self.on_move_down is not None:
+            buttons.append(
+                ft.IconButton(
+                    icon=ft.Icons.KEYBOARD_ARROW_DOWN,
+                    icon_color=theme.Colors.text_secondary,
+                    tooltip="Move down in the queue",
+                    on_click=lambda _: self.on_move_down(self.job),
+                )
+            )
         if self.job.status == JobStatus.DONE and self.on_open_folder is not None:
             buttons.append(
                 ft.IconButton(

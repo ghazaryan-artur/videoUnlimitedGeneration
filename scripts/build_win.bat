@@ -123,6 +123,11 @@ echo [build_win] running PyInstaller ...
   --hidden-import anthropic ^
   --hidden-import winotify ^
   --hidden-import playwright ^
+  --exclude-module tkinter ^
+  --exclude-module _tkinter ^
+  --exclude-module Tkinter ^
+  --exclude-module tcl ^
+  --exclude-module tk ^
   "%ROOT%\runway_app.py"
 set "PYI_ERR=%errorlevel%"
 

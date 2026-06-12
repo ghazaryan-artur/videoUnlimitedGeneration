@@ -23,6 +23,7 @@ submit and pick up at polling (or directly at download).
 from __future__ import annotations
 
 import asyncio
+import random
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime, timezone
@@ -111,6 +112,11 @@ class BatchRunner:
         # All jobs we've ever taken responsibility for (for is_idle check)
         self._known_ids: set[str] = set()
 
+        # Monotonic counter for queue_order — assigned to fresh jobs in
+        # add_jobs() so the user can later rearrange PENDING cards via the
+        # ▲/▼ buttons (see reorder_pending()).
+        self._next_queue_order: int = 1
+
     # ── public API ───────────────────────────────────────────────────
 
     async def ensure_started(self) -> None:
@@ -149,14 +155,26 @@ class BatchRunner:
             await storage.insert_batch(batch)
             for j in jobs:
                 j.batch_id = batch.id
+                # Stamp a monotonic queue_order so the UI can rearrange
+                # PENDING cards. Skip if already set (e.g. tests).
+                if j.queue_order == 0:
+                    j.queue_order = self._next_queue_order
+                    self._next_queue_order += 1
+                else:
+                    # Keep the counter ahead of any pre-set value
+                    if j.queue_order >= self._next_queue_order:
+                        self._next_queue_order = j.queue_order + 1
                 await storage.upsert_job(j)
                 self._notify(j)
         else:
-            # Resume: fix up half-states and just notify the UI
+            # Resume: fix up half-states + advance our counter past any
+            # already-stored queue_order so future fresh jobs don't collide.
             for j in jobs:
                 if j.status == JobStatus.SUBMITTING and j.runway_task_id is None:
                     j.transition_to(JobStatus.PENDING)
                     await storage.upsert_job(j)
+                if j.queue_order >= self._next_queue_order:
+                    self._next_queue_order = j.queue_order + 1
                 self._notify(j)
 
         for j in jobs:
@@ -328,6 +346,47 @@ class BatchRunner:
             return
         self._loop.call_soon_threadsafe(self._do_purge_pending, job_id)
 
+    def reorder_pending(self, ordered_job_ids: list[str]) -> None:
+        """Re-arrange queued (un-started) jobs to match the given id order.
+
+        Items in the queue NOT mentioned in `ordered_job_ids` are preserved
+        and appended at the end. Shutdown sentinels (None) stay at the back
+        so a pending aclose() still wakes workers up.
+
+        Safe to call from any thread — work is dispatched onto the runner
+        loop via call_soon_threadsafe, mirroring purge_pending().
+        """
+        if self._loop is None:
+            return
+        self._loop.call_soon_threadsafe(
+            self._do_reorder_pending, list(ordered_job_ids),
+        )
+
+    def _do_reorder_pending(self, ordered_job_ids: list[str]) -> None:
+        drained: list[Job | None] = []
+        by_id: dict[str, Job] = {}
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            drained.append(item)
+            if item is not None:
+                by_id[item.id] = item
+
+        wanted = set(ordered_job_ids)
+        leftovers = [it for it in drained if it is not None and it.id not in wanted]
+        sentinels = [it for it in drained if it is None]
+
+        for jid in ordered_job_ids:
+            j = by_id.get(jid)
+            if j is not None:
+                self._queue.put_nowait(j)
+        for j in leftovers:
+            self._queue.put_nowait(j)
+        for s in sentinels:
+            self._queue.put_nowait(s)
+
     def _do_purge_pending(self, job_id: str) -> None:
         # Drop the id BEFORE draining so an in-flight pickup also bails.
         self._known_ids.discard(job_id)
@@ -478,6 +537,36 @@ class BatchRunner:
                 logger.exception("worker {} crashed on job {}", worker_index, job.id)
             finally:
                 self._inflight.pop(job.id, None)
+
+            # Cool-down between consecutive jobs. Interruptible by cancel
+            # so the user doesn't have to wait through a 60s pause to abort.
+            await self._post_job_pause(worker_index)
+
+    async def _post_job_pause(self, worker_index: int) -> None:
+        """Random pause between this worker's consecutive job pickups.
+
+        Bounds come from settings (`post_job_pause_min_seconds` /
+        `_max_seconds`). Each worker rolls a fresh value, so two workers
+        won't snap back into lockstep after every job. Setting max to 0
+        disables the pause entirely.
+        """
+        lo = float(settings.post_job_pause_min_seconds)
+        hi = float(settings.post_job_pause_max_seconds)
+        if hi <= 0:
+            return
+        if lo < 0:
+            lo = 0.0
+        if lo > hi:
+            lo = hi
+        delay = random.uniform(lo, hi)
+        logger.info("worker {} pausing {:.1f}s before next job", worker_index, delay)
+        try:
+            # wait_for resolves either way: on natural timeout (we slept the
+            # full delay) or when cancel_event flips (early exit). Both are
+            # fine — the outer loop re-checks cancel_event on next iteration.
+            await asyncio.wait_for(self._cancel_event.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
 
     # ── per-job lifecycle ────────────────────────────────────────────
 

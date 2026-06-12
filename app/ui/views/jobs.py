@@ -16,6 +16,7 @@ from app.core.ai_variations import (
     get_stored_api_key,
     store_api_key,
 )
+from app.core.authors import add_author, delete_author, list_authors
 from app.core.importer import import_file
 from app.core.job import Job, JobStatus, PromptDraft
 from app.core.notify import (
@@ -152,6 +153,54 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
         except ValueError:
             state.drafts.append(copy)
         rebuild()
+
+    def _move_pending(job: Job, *, direction: int) -> None:
+        """Swap queue_order with the nearest PENDING neighbour above/below.
+
+        direction = -1 → move up, +1 → move down. Only PENDING jobs are
+        eligible; SUBMITTING/QUEUED are already with Runway and cannot be
+        reordered locally.
+        """
+        if job.status != JobStatus.PENDING:
+            return
+        pending_sorted = sorted(
+            (j for j in state.active_jobs.values() if j.status == JobStatus.PENDING),
+            key=lambda j: (j.queue_order, j.created_at),
+        )
+        try:
+            idx = next(i for i, j in enumerate(pending_sorted) if j.id == job.id)
+        except StopIteration:
+            return
+        target_idx = idx + direction
+        if target_idx < 0 or target_idx >= len(pending_sorted):
+            return
+        neighbour = pending_sorted[target_idx]
+        # Swap queue_order between the two cards
+        job.queue_order, neighbour.queue_order = neighbour.queue_order, job.queue_order
+
+        async def _persist_and_reorder() -> None:
+            from app.core import storage
+            try:
+                await storage.upsert_job(job)
+                await storage.upsert_job(neighbour)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("move_pending: storage upsert failed: {}", e)
+            if state.runner is not None:
+                # Tell runner the new desired pickup order
+                new_pending = sorted(
+                    (j for j in state.active_jobs.values() if j.status == JobStatus.PENDING),
+                    key=lambda j: (j.queue_order, j.created_at),
+                )
+                state.runner.reorder_pending([j.id for j in new_pending])
+
+        page.run_task(_persist_and_reorder)
+        rebuild()
+
+    def move_job_up(job: Job) -> None:
+        _move_pending(job, direction=-1)
+
+    def move_job_down(job: Job) -> None:
+        _move_pending(job, direction=+1)
 
     def _toast(msg: str) -> None:
         page.snack_bar = ft.SnackBar(
@@ -828,15 +877,27 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
 
         active_jobs_sorted = sorted(
             (j for j in state.active_jobs.values() if not is_terminal(j)),
-            key=lambda j: j.created_at,
+            key=lambda j: (j.queue_order, j.created_at),
         )
+        # Track which PENDING positions can move up/down so we can disable
+        # the edge buttons. Only PENDING jobs are reorderable — once a job
+        # is SUBMITTING/QUEUED its slot is already with Runway.
+        pending_ids = [j.id for j in active_jobs_sorted if j.status == JobStatus.PENDING]
         for j in active_jobs_sorted:
+            is_pending = j.status == JobStatus.PENDING
+            idx = pending_ids.index(j.id) if is_pending else -1
             card = JobCard(
                 j, page,
                 on_open_folder=open_for_job,
                 on_cancel=cancel_one_job,
                 on_copy_prompt=copy_job_prompt,
                 on_duplicate_as_draft=duplicate_job_as_draft,
+                on_move_up=move_job_up if is_pending and idx > 0 else None,
+                on_move_down=(
+                    move_job_down
+                    if is_pending and 0 <= idx < len(pending_ids) - 1
+                    else None
+                ),
             )
             job_card_index[j.id] = card
             active_column.controls.append(card.control)
@@ -858,17 +919,26 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
                 ft.Icons.AUTO_AWESOME,
             ))
 
-        # COMPLETED TAB: terminal in active_jobs + cached from DB
+        # COMPLETED TAB: terminal in active_jobs + cached from DB,
+        # filtered to "mine" — i.e. matching the session's selected author.
+        # Legacy jobs (author=None, from before this feature) are hidden
+        # here; they remain visible via the History view.
         completed_column.controls.clear()
-        # Combine active_jobs[terminal] + completed_jobs_cache, dedupe by id
         seen_ids: set[str] = set()
         merged: list[Job] = []
+        selected = state.selected_author
+
+        def _belongs_to_me(j: Job) -> bool:
+            if selected is None:
+                return False
+            return j.author == selected
+
         for j in state.active_jobs.values():
-            if is_terminal(j) and j.id not in seen_ids:
+            if is_terminal(j) and j.id not in seen_ids and _belongs_to_me(j):
                 merged.append(j)
                 seen_ids.add(j.id)
         for j in completed_jobs_cache:
-            if j.id not in seen_ids:
+            if j.id not in seen_ids and _belongs_to_me(j):
                 merged.append(j)
                 seen_ids.add(j.id)
         merged.sort(key=lambda j: j.created_at, reverse=True)
@@ -902,6 +972,15 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
         completion_state["was_active"] = any_active_now
 
         update_summary()
+        # Flet's web client sometimes drops dynamic-list deltas when only
+        # the inner `.controls` collection of a scrollable Column inside a
+        # Tab changes — `page.update()` alone leaves the page stale until
+        # F5. Force-flush each column first so the diff is unambiguous.
+        try:
+            active_column.update()
+            completed_column.update()
+        except Exception:
+            pass
         try:
             page.update()
         except Exception:
@@ -1061,6 +1140,247 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
         else:
             batch_progress.visible = False
 
+    # ── author selector ────────────────────────────────────────────
+    # The list of authors is shared across all sessions (SQLite). The
+    # selection is per-session — see AppState.selected_author. Generation
+    # is gated on having one picked.
+
+    authors_cache: list[str] = []
+
+    author_dropdown = ft.Dropdown(
+        label="Author",
+        value=state.selected_author,
+        options=[],
+        width=200,
+        bgcolor=theme.Colors.surface_2,
+        border_color=theme.Colors.border,
+        focused_border_color=theme.Colors.primary,
+        color=theme.Colors.text_primary,
+        label_style=ft.TextStyle(color=theme.Colors.text_secondary),
+        hint_text="Pick author…",
+    )
+
+    def _on_author_change(e: ft.ControlEvent) -> None:
+        v = (e.control.value or "").strip()
+        state.selected_author = v or None
+        # Completed tab is filtered by author, so it has to repaint when
+        # the user switches. Active stays shared and is unaffected.
+        rebuild()
+
+    author_dropdown.on_change = _on_author_change
+
+    def _refresh_author_dropdown() -> None:
+        author_dropdown.options = [ft.dropdown.Option(a, a) for a in authors_cache]
+        # If the previously-selected author was deleted elsewhere, clear it.
+        if state.selected_author and state.selected_author not in authors_cache:
+            state.selected_author = None
+        author_dropdown.value = state.selected_author
+        try:
+            author_dropdown.update()
+        except Exception:
+            pass
+
+    async def _reload_authors() -> None:
+        try:
+            names = await list_authors()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("list_authors failed: {}", e)
+            names = []
+        authors_cache.clear()
+        authors_cache.extend(names)
+        _refresh_author_dropdown()
+        # If there are no authors at all, prompt the user to add one. They
+        # have to add at least one before Start batch will work.
+        if not authors_cache:
+            _open_authors_dialog(force_add=True)
+
+    def _open_authors_dialog(*, force_add: bool = False) -> None:
+        list_column = ft.Column([], spacing=4, scroll=ft.ScrollMode.AUTO, tight=True)
+
+        new_name_field = ft.TextField(
+            label="New author name",
+            hint_text="e.g. Anna",
+            autofocus=force_add,
+            bgcolor=theme.Colors.surface_2,
+            border_color=theme.Colors.border,
+            focused_border_color=theme.Colors.primary,
+            color=theme.Colors.text_primary,
+            label_style=ft.TextStyle(color=theme.Colors.text_secondary),
+            cursor_color=theme.Colors.primary,
+            text_size=13,
+            expand=True,
+        )
+
+        def _render_list() -> None:
+            list_column.controls.clear()
+            if not authors_cache:
+                list_column.controls.append(
+                    ft.Text(
+                        "No authors yet. Add the first one below.",
+                        size=12, color=theme.Colors.text_dim,
+                    )
+                )
+            for name in authors_cache:
+                def make_pick(n: str):
+                    def _pick(_e: ft.ControlEvent) -> None:
+                        state.selected_author = n
+                        _refresh_author_dropdown()
+                        rebuild()  # Completed tab depends on selected author
+                        page.close(dialog)
+                    return _pick
+
+                def make_delete(n: str):
+                    async def _do_delete() -> None:
+                        try:
+                            await delete_author(n)
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning("delete_author failed: {}", e)
+                        await _reload_authors()
+                        _render_list()
+                    def _del(_e: ft.ControlEvent) -> None:
+                        page.run_task(_do_delete)
+                    return _del
+
+                is_current = name == state.selected_author
+                list_column.controls.append(
+                    ft.Container(
+                        content=ft.Row(
+                            [
+                                ft.Icon(
+                                    ft.Icons.PERSON,
+                                    size=16,
+                                    color=theme.Colors.primary if is_current
+                                    else theme.Colors.text_dim,
+                                ),
+                                ft.Text(
+                                    name,
+                                    size=13,
+                                    weight=ft.FontWeight.W_600 if is_current
+                                    else ft.FontWeight.W_500,
+                                    color=theme.Colors.text_primary,
+                                    expand=True,
+                                ),
+                                ft.TextButton(
+                                    text="Use",
+                                    on_click=make_pick(name),
+                                    style=ft.ButtonStyle(
+                                        color={"": theme.Colors.primary},
+                                    ),
+                                ),
+                                ft.IconButton(
+                                    icon=ft.Icons.DELETE_OUTLINE,
+                                    icon_color=theme.Colors.text_dim,
+                                    tooltip="Delete this author",
+                                    on_click=make_delete(name),
+                                ),
+                            ],
+                            spacing=4,
+                        ),
+                        bgcolor=theme.Colors.surface_2,
+                        border=ft.border.all(
+                            1,
+                            theme.Colors.primary if is_current else theme.Colors.border,
+                        ),
+                        border_radius=8,
+                        padding=ft.padding.symmetric(horizontal=10, vertical=6),
+                    )
+                )
+            try:
+                list_column.update()
+            except Exception:
+                pass
+
+        async def _do_add() -> None:
+            n = (new_name_field.value or "").strip()
+            if not n:
+                new_name_field.error_text = "Name required"
+                try:
+                    new_name_field.update()
+                except Exception:
+                    pass
+                return
+            try:
+                ok = await add_author(n)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("add_author failed: {}", e)
+                ok = False
+            if not ok:
+                new_name_field.error_text = "Already exists or invalid"
+                try:
+                    new_name_field.update()
+                except Exception:
+                    pass
+                return
+            new_name_field.value = ""
+            new_name_field.error_text = None
+            try:
+                new_name_field.update()
+            except Exception:
+                pass
+            # First add auto-selects so the user is unblocked immediately
+            if state.selected_author is None:
+                state.selected_author = n
+            await _reload_authors()
+            _render_list()
+
+        def _on_add_click(_e: ft.ControlEvent) -> None:
+            page.run_task(_do_add)
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            bgcolor=theme.Colors.surface,
+            title=ft.Row(
+                [
+                    ft.Icon(ft.Icons.PEOPLE_ALT, color=theme.Colors.primary, size=22),
+                    ft.Text(
+                        "Authors",
+                        color=theme.Colors.text_primary,
+                        size=16,
+                        weight=ft.FontWeight.W_600,
+                    ),
+                ],
+                spacing=8,
+            ),
+            content=ft.Container(
+                width=520,
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            "Each video is saved under downloads/<Author>/… — pick "
+                            "yours below or add a new one. The list is shared across "
+                            "everyone on the server.",
+                            size=12, color=theme.Colors.text_dim,
+                        ),
+                        ft.Container(height=10),
+                        ft.Container(content=list_column, height=240),
+                        ft.Container(height=10),
+                        ft.Divider(color=theme.Colors.border),
+                        ft.Container(height=10),
+                        ft.Row(
+                            [
+                                new_name_field,
+                                theme.primary_button(
+                                    "Add",
+                                    on_click=_on_add_click,
+                                    icon=ft.Icons.PERSON_ADD,
+                                ),
+                            ],
+                            spacing=8,
+                        ),
+                    ],
+                    spacing=0, tight=True,
+                ),
+            ),
+            actions=[
+                theme.secondary_button("Close", on_click=lambda _e: page.close(dialog)),
+            ],
+        )
+        page.open(dialog)
+        _render_list()
+
+    def open_authors_dialog(_: ft.ControlEvent) -> None:
+        _open_authors_dialog()
+
     # ── handlers ───────────────────────────────────────────────────
 
     def add_prompt(_: ft.ControlEvent) -> None:
@@ -1085,6 +1405,14 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
             page.update()
         except Exception:
             pass
+
+    # In web mode the BatchRunner is process-global and owns its own
+    # on_update wiring; this page must subscribe explicitly so it gets
+    # notified about jobs started by other sessions (or by the resume
+    # path on process startup). No-op in desktop — that build still uses
+    # the per-session BatchRunner whose `on_update=` constructor arg
+    # already calls on_runner_update directly.
+    state.install_session_listener(on_runner_update)
 
     def ensure_runner() -> None:
         """Create the persistent runner once per session if not already.
@@ -1112,6 +1440,19 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
             page.update()
             return
 
+        # Gate on author selection — every video has to land under an
+        # author folder, and the list is shared. If nothing is picked we
+        # open the manager so the user can choose or add one.
+        if not state.selected_author:
+            page.snack_bar = ft.SnackBar(
+                ft.Text("Pick an author first — it becomes the top-level folder."),
+                bgcolor=theme.Colors.surface_2,
+            )
+            page.snack_bar.open = True
+            page.update()
+            _open_authors_dialog(force_add=not authors_cache)
+            return
+
         # If a transient websocket disconnect nulled the client but the JWT
         # is still valid, re-hydrate the client instead of bouncing the user
         # back to /login.
@@ -1121,10 +1462,12 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
 
         ensure_runner()
 
-        # Expand drafts → jobs (drafts are removed once expanded)
+        # Expand drafts → jobs (drafts are removed once expanded).
+        # The selected author becomes the first path segment of output_dir
+        # for every job, so Downloads view groups by creator.
         all_jobs: list[Job] = []
         for d in valid_drafts:
-            all_jobs.extend(d.expand())
+            all_jobs.extend(d.expand(author=state.selected_author))
             state.drafts.remove(d)
         for j in all_jobs:
             state.active_jobs[j.id] = j
@@ -1735,6 +2078,13 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
         on_click=do_logout,
     )
 
+    manage_authors_btn = ft.IconButton(
+        icon=ft.Icons.PEOPLE_ALT,
+        icon_color=theme.Colors.text_secondary,
+        tooltip="Manage authors (add / remove)",
+        on_click=open_authors_dialog,
+    )
+
     header = ft.Container(
         content=ft.Column(
             [
@@ -1749,6 +2099,9 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
                         ),
                         ft.Container(expand=True),
                         user_label,
+                        ft.Container(width=8),
+                        author_dropdown,
+                        manage_authors_btn,
                         ft.Container(width=8),
                         import_btn,
                         templates_btn,
@@ -1914,6 +2267,10 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
 
     # Pull recent terminal jobs into the Completed tab on startup
     page.run_task(reload_completed_from_db)
+
+    # Load shared authors list — also opens the "add your first author"
+    # prompt if the table is empty (since generation is gated on it).
+    page.run_task(_reload_authors)
 
     # ── resume-on-restart: pick up ALL unfinished jobs from a previous run ─
     async def attempt_resume() -> None:

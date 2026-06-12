@@ -82,6 +82,12 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_api_log_ts        ON api_log(ts)",
     "CREATE INDEX IF NOT EXISTS idx_api_log_status    ON api_log(status)",
     "CREATE INDEX IF NOT EXISTS idx_api_log_related   ON api_log(related_task_id)",
+    """
+    CREATE TABLE IF NOT EXISTS authors (
+        name        TEXT PRIMARY KEY,
+        created_at  TEXT NOT NULL
+    )
+    """,
 )
 
 
@@ -101,6 +107,8 @@ def db_path() -> Path:
 _MIGRATIONS: tuple[tuple[str, str], ...] = (
     # (column_name, ALTER stmt) — applied if column doesn't exist on jobs.
     ("output_dir", "ALTER TABLE jobs ADD COLUMN output_dir TEXT"),
+    ("queue_order", "ALTER TABLE jobs ADD COLUMN queue_order INTEGER NOT NULL DEFAULT 0"),
+    ("author", "ALTER TABLE jobs ADD COLUMN author TEXT"),
 )
 
 
@@ -164,6 +172,7 @@ def _job_to_row(job: Job) -> dict[str, Any]:
         "audio": int(job.audio),
         "name": job.name,
         "output_dir": job.output_dir,
+        "author": job.author,
         "runway_task_id": job.runway_task_id,
         "runway_session_id": job.runway_session_id,
         "runway_asset_group_id": job.runway_asset_group_id,
@@ -171,6 +180,7 @@ def _job_to_row(job: Job) -> dict[str, Any]:
         "progress_ratio": job.progress_ratio,
         "estimated_start_seconds": job.estimated_start_seconds,
         "error_reason": job.error_reason,
+        "queue_order": job.queue_order,
         "output_path": job.output_path,
         "file_size_bytes": job.file_size_bytes,
         "download_bytes_done": job.download_bytes_done,
@@ -197,14 +207,14 @@ def _row_to_job(row: aiosqlite.Row) -> Job:
 _INSERT_JOB_SQL = """
 INSERT INTO jobs (
     id, batch_id, model_task_type, prompt, duration, aspect_ratio, resolution,
-    audio, name, output_dir, runway_task_id, runway_session_id, runway_asset_group_id,
-    status, progress_ratio, estimated_start_seconds, error_reason,
+    audio, name, output_dir, author, runway_task_id, runway_session_id, runway_asset_group_id,
+    status, progress_ratio, estimated_start_seconds, error_reason, queue_order,
     output_path, file_size_bytes, download_bytes_done,
     created_at, submitted_at, started_at, completed_at, downloaded_at
 ) VALUES (
     :id, :batch_id, :model_task_type, :prompt, :duration, :aspect_ratio, :resolution,
-    :audio, :name, :output_dir, :runway_task_id, :runway_session_id, :runway_asset_group_id,
-    :status, :progress_ratio, :estimated_start_seconds, :error_reason,
+    :audio, :name, :output_dir, :author, :runway_task_id, :runway_session_id, :runway_asset_group_id,
+    :status, :progress_ratio, :estimated_start_seconds, :error_reason, :queue_order,
     :output_path, :file_size_bytes, :download_bytes_done,
     :created_at, :submitted_at, :started_at, :completed_at, :downloaded_at
 )
@@ -221,6 +231,7 @@ UPDATE jobs SET
     audio = :audio,
     name = :name,
     output_dir = :output_dir,
+    author = :author,
     runway_task_id = :runway_task_id,
     runway_session_id = :runway_session_id,
     runway_asset_group_id = :runway_asset_group_id,
@@ -228,6 +239,7 @@ UPDATE jobs SET
     progress_ratio = :progress_ratio,
     estimated_start_seconds = :estimated_start_seconds,
     error_reason = :error_reason,
+    queue_order = :queue_order,
     output_path = :output_path,
     file_size_bytes = :file_size_bytes,
     download_bytes_done = :download_bytes_done,
@@ -282,7 +294,8 @@ async def list_unfinished_jobs() -> list[Job]:
     )
     async with connection() as db:
         cur = await db.execute(
-            f"SELECT * FROM jobs WHERE status IN ({placeholders}) ORDER BY created_at",
+            f"SELECT * FROM jobs WHERE status IN ({placeholders}) "
+            "ORDER BY queue_order, created_at",
             statuses,
         )
         rows = await cur.fetchall()

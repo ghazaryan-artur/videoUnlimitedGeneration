@@ -77,6 +77,9 @@ class Job(BaseModel):
     audio: bool
     name: str | None = None
     output_dir: str | None = None  # destination folder; None → app default
+    # Author who started this job — drives Completed/Downloads filtering.
+    # None means a legacy job from before authors existed.
+    author: str | None = None
 
     # Server-side identifiers (set after submission)
     runway_task_id: str | None = None
@@ -88,6 +91,11 @@ class Job(BaseModel):
     progress_ratio: float = 0.0
     estimated_start_seconds: int | None = None
     error_reason: str | None = None
+
+    # Position in the local pre-submit queue. Lower = picked up sooner.
+    # Assigned monotonically by BatchRunner.add_jobs() for fresh jobs;
+    # mutated by the user via the ▲/▼ buttons on PENDING cards.
+    queue_order: int = 0
 
     # Output
     output_path: str | None = None
@@ -186,13 +194,16 @@ class PromptDraft(BaseModel):
             base = _first_words(self.prompt, 5)
         return safe_folder_name(base)
 
-    def expand(self) -> list[Job]:
+    def expand(self, *, author: str | None = None) -> list[Job]:
         """Materialize into one Job per video to generate.
 
         Web mode only: if the user didn't set output_dir, all videos from
         this draft are grouped into a folder derived from `name` / first 5
         prompt words. Desktop mode behaviour is unchanged (output_dir is
         passed through as-is — None means the default Videos folder).
+
+        If `author` is given, it becomes the FIRST segment of output_dir
+        (so Downloads view groups by creator).
         """
         from app.paths import is_web_mode  # local to avoid circular import
         if self.output_dir and self.output_dir.strip():
@@ -201,6 +212,12 @@ class PromptDraft(BaseModel):
             folder = self.auto_folder()
         else:
             folder = None
+
+        if author:
+            author_seg = safe_folder_name(author)
+            if author_seg:
+                folder = f"{author_seg}/{folder}" if folder else author_seg
+
         jobs: list[Job] = []
         for i in range(max(1, self.count)):
             jobs.append(Job(
@@ -212,5 +229,6 @@ class PromptDraft(BaseModel):
                 audio=self.audio,
                 name=self.make_name_for(i),
                 output_dir=folder,
+                author=author or None,
             ))
         return jobs

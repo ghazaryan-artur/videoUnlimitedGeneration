@@ -21,6 +21,9 @@ from app.ui.views.splash import build_splash_view
 
 async def main(page: ft.Page) -> None:
     theme.apply(page)
+    # In web mode, runtime.startup() (FastAPI lifespan) already initialized
+    # the DB. Calling init_db() again here is harmless (idempotent) but the
+    # purge below is per-session work that's fine to keep either way.
     await init_db()
     # Purge old api_log rows so the DB doesn't snowball
     try:
