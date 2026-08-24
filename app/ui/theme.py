@@ -158,13 +158,13 @@ def card_container(content: ft.Control, *, padding: int | ft.Padding = 20,
 # ── author / credits ──────────────────────────────────────────────────
 
 
-AUTHOR_NAME = "Frunze Altunyan"
-AUTHOR_GITHUB_URL = "https://github.com/UIME"
-AUTHOR_GITHUB_HANDLE = "github.com/UIME"
+AUTHOR_NAME = "Artur Ghazaryan"
+AUTHOR_GITHUB_URL = "https://github.com/ghazaryan-artur"
+AUTHOR_GITHUB_HANDLE = "github.com/ghazaryan-artur"
 
 
 def author_footer(page: ft.Page) -> ft.Control:
-    """Small "Made by NAME · github.com/UIME" footer with a clickable link.
+    """Small "Made by NAME · github.com/HANDLE" footer with a clickable link.
 
     Drop into login / activation views (or anywhere else) for credit.
     """

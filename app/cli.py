@@ -11,9 +11,9 @@ Usage:
       Shows the stored token's user, expiry.
 
   python -m app.cli generate "your prompt here"
-      [--model seedance_2|kling_3_0_pro]
-      [--duration 5|10|15]
-      [--aspect 16:9|9:16|1:1]
+      [--model seedance_2_5|seedance_2|kling_3_0_pro]
+      [--duration 4..15  (model-dependent)]
+      [--aspect 16:9|9:16|1:1|21:9|4:3|3:4  (model-dependent)]
       [--audio/--no-audio]
       [--name "custom name"]
 

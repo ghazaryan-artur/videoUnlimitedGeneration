@@ -1,5 +1,6 @@
 """Runway model profiles. Importing this package registers all known models."""
 from .base import ModelProfile, all_profiles, by_task_type, register
+from .seedance_2_5 import SEEDANCE_2_5
 from .seedance_2 import SEEDANCE_2
 from .kling_3_pro import KLING_3_PRO
 from .kling_3_4k import KLING_3_4K
@@ -11,6 +12,7 @@ __all__ = [
     "all_profiles",
     "by_task_type",
     "register",
+    "SEEDANCE_2_5",
     "SEEDANCE_2",
     "KLING_3_PRO",
     "KLING_3_4K",
