@@ -17,7 +17,7 @@ import aiosqlite
 from loguru import logger
 
 from app.core.job import Batch, Job, JobStatus
-from app.paths import db_file
+from app.paths import db_file, output_dir
 from app.runway.client import ApiLogEntry
 from app.settings import settings
 
@@ -88,6 +88,13 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         created_at  TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS downloaded_files (
+        rel_path         TEXT PRIMARY KEY,
+        first_downloaded_at TEXT NOT NULL,
+        download_count   INTEGER NOT NULL DEFAULT 1
+    )
+    """,
 )
 
 
@@ -122,6 +129,41 @@ async def _apply_migrations(db: aiosqlite.Connection) -> None:
             await db.execute(stmt)
 
 
+async def _import_legacy_download_marks(db: aiosqlite.Connection) -> None:
+    """Carry over "downloaded" marks written by the older implementation,
+    which stamped `jobs.user_downloaded_at` (keyed by absolute output_path)
+    instead of the `downloaded_files` table. INSERT OR IGNORE — marks are
+    permanent, so re-running on every startup is harmless."""
+    cur = await db.execute("PRAGMA table_info(jobs)")
+    if "user_downloaded_at" not in {r[1] for r in await cur.fetchall()}:
+        return
+    cur = await db.execute(
+        "SELECT output_path, user_downloaded_at FROM jobs "
+        "WHERE user_downloaded_at IS NOT NULL AND output_path IS NOT NULL"
+    )
+    rows = await cur.fetchall()
+    if not rows:
+        return
+    roots = {output_dir(), output_dir().resolve()}
+    for output_path, stamped_at in rows:
+        rel = None
+        for root in roots:
+            for candidate in (Path(output_path), Path(output_path).resolve()):
+                try:
+                    rel = candidate.relative_to(root).as_posix()
+                    break
+                except ValueError:
+                    continue
+            if rel:
+                break
+        if rel:
+            await db.execute(
+                "INSERT OR IGNORE INTO downloaded_files (rel_path, first_downloaded_at) "
+                "VALUES (?, ?)",
+                (rel, stamped_at),
+            )
+
+
 async def init_db() -> None:
     """Create schema if missing — safe to call every startup."""
     p = db_path()
@@ -132,6 +174,7 @@ async def init_db() -> None:
         for stmt in SCHEMA_STATEMENTS:
             await db.execute(stmt)
         await _apply_migrations(db)
+        await _import_legacy_download_marks(db)
         await db.commit()
     logger.info("DB ready at {}", p)
 
@@ -339,6 +382,40 @@ async def delete_job(job_id: str) -> bool:
         cur = await db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
         await db.commit()
     return cur.rowcount > 0
+
+
+# ── downloaded-files tracking ────────────────────────────────────────
+# Records that a viewer actually fetched a finished video through the
+# /downloads/<file> (or /downloads-zip/<folder>/) route — as opposed to
+# `Job.downloaded_at`, which marks when *the app itself* pulled the file
+# down from Runway onto the server. Used by the Downloads view to tint a
+# video's card green once it has been saved at least once, by anyone.
+#
+# Marks are permanent by design: keyed by file path (not by job row), so
+# "Clear completed", deleting a job, or deleting the file never un-marks
+# a video. There is intentionally no delete function.
+
+
+async def mark_file_downloaded(rel_path: str) -> None:
+    async with connection() as db:
+        await db.execute(
+            """
+            INSERT INTO downloaded_files (rel_path, first_downloaded_at, download_count)
+            VALUES (?, ?, 1)
+            ON CONFLICT(rel_path) DO UPDATE SET
+                download_count = download_count + 1
+            """,
+            (rel_path, datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+
+
+async def list_downloaded_rel_paths() -> set[str]:
+    async with connection() as db:
+        cur = await db.execute("SELECT rel_path FROM downloaded_files")
+        rows = await cur.fetchall()
+    return {r[0] for r in rows}
+
 
 
 # ── batches ──────────────────────────────────────────────────────────

@@ -20,7 +20,7 @@ import flet as ft
 from loguru import logger
 
 from app.core.job import Job, PromptDraft, safe_folder_name
-from app.core.storage import list_recent_jobs
+from app.core.storage import list_downloaded_rel_paths, list_recent_jobs
 from app.paths import is_web_mode, output_dir
 from app.runway.models import by_task_type
 from app.ui import theme
@@ -199,12 +199,21 @@ def _file_row(
     on_copy_prompt=None,
     on_duplicate_as_draft=None,
     on_delete=None,
+    *,
+    downloaded: bool = False,
 ) -> ft.Control:
     url = f"/downloads/{quote(entry.rel_path)}" if is_web_mode() else None
 
     def do_download(_: ft.ControlEvent) -> None:
         if url:
             page.launch_url(url)
+            # The server records the download when the browser fetches the
+            # file; tint the row right away instead of waiting for a reload.
+            _apply_tint(row, downloaded=True)
+            try:
+                row.update()
+            except Exception:
+                pass
 
     title = (job.name if (job and job.name) else entry.path.name).strip() or entry.path.name
     subtitle_parts: list[str] = [
@@ -252,7 +261,7 @@ def _file_row(
             on_click=lambda _: on_delete(entry, job),
         ))
 
-    return ft.Container(
+    row = ft.Container(
         content=ft.Row(
             [
                 _thumb_image(entry.rel_path, _THUMB_W, _THUMB_H),
@@ -290,11 +299,23 @@ def _file_row(
             spacing=14,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         ),
-        bgcolor=theme.Colors.surface_2,
         border_radius=8,
-        border=ft.border.all(1, theme.Colors.border),
         padding=ft.padding.symmetric(horizontal=14, vertical=10),
     )
+    _apply_tint(row, downloaded=downloaded)
+    return row
+
+
+def _apply_tint(row: ft.Container, *, downloaded: bool) -> None:
+    """Light-green card once the file has been saved at least once — tracked
+    server-side in `downloaded_files` (see storage.mark_file_downloaded), so
+    it survives reloads and is shared by everyone who sees this folder."""
+    if downloaded:
+        row.bgcolor = theme.Colors.surface_done
+        row.border = ft.border.all(1, theme.Colors.border_done)
+    else:
+        row.bgcolor = theme.Colors.surface_2
+        row.border = ft.border.all(1, theme.Colors.border)
 
 
 def _folder_card(
@@ -304,6 +325,7 @@ def _folder_card(
     *,
     page: ft.Page | None = None,
     folder_rel: str | None = None,
+    all_downloaded: bool = False,
 ) -> ft.Control:
     # "First video" = chronologically earliest by mtime → last after desc sort
     preview = files[-1]
@@ -322,6 +344,12 @@ def _folder_card(
 
         def _download_all(_e: ft.ControlEvent) -> None:
             page.launch_url(zip_url)
+            card.bgcolor = theme.Colors.surface_done
+            card.border = ft.border.all(1, theme.Colors.border_done)
+            try:
+                card.update()
+            except Exception:
+                pass
 
         right_controls.append(
             ft.IconButton(
@@ -339,7 +367,7 @@ def _folder_card(
         )
     )
 
-    return ft.Container(
+    card = ft.Container(
         content=ft.Row(
             [
                 _thumb_image(preview.rel_path, _FOLDER_THUMB_W, _FOLDER_THUMB_H),
@@ -377,13 +405,17 @@ def _folder_card(
             spacing=14,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         ),
-        bgcolor=theme.Colors.surface_2,
+        # Green once every video inside has been downloaded at least once.
+        bgcolor=theme.Colors.surface_done if all_downloaded else theme.Colors.surface_2,
         border_radius=10,
-        border=ft.border.all(1, theme.Colors.border),
+        border=ft.border.all(
+            1, theme.Colors.border_done if all_downloaded else theme.Colors.border,
+        ),
         padding=ft.padding.symmetric(horizontal=14, vertical=12),
         ink=True,
         on_click=lambda _e: on_open(folder_name),
     )
+    return card
 
 
 def _breadcrumb(folder_name: str, on_back) -> ft.Control:
@@ -603,6 +635,12 @@ def build_downloads_view(page: ft.Page, state: AppState) -> ft.View:
         except Exception as e:  # noqa: BLE001
             logger.warning("load jobs for /downloads failed: {}", e)
 
+        try:
+            downloaded_rel_paths = await list_downloaded_rel_paths()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("load downloaded marks failed: {}", e)
+            downloaded_rel_paths = set()
+
         controls: list[ft.Control] = []
         cur = current_folder["name"]
 
@@ -612,6 +650,7 @@ def build_downloads_view(page: ft.Page, state: AppState) -> ft.View:
                 controls.append(_folder_card(
                     fname, files, enter_folder,
                     page=page, folder_rel=folder_rel,
+                    all_downloaded=all(f.rel_path in downloaded_rel_paths for f in files),
                 ))
             for entry in loose:
                 controls.append(_file_row(
@@ -619,6 +658,7 @@ def build_downloads_view(page: ft.Page, state: AppState) -> ft.View:
                     on_copy_prompt=copy_job_prompt,
                     on_duplicate_as_draft=duplicate_job_as_draft,
                     on_delete=confirm_delete,
+                    downloaded=entry.rel_path in downloaded_rel_paths,
                 ))
             if not controls:
                 controls.append(empty_state_root)
@@ -630,11 +670,12 @@ def build_downloads_view(page: ft.Page, state: AppState) -> ft.View:
             else:
                 for entry in matched:
                     controls.append(_file_row(
-                    page, entry, jobs_by_filename.get(entry.path.name),
-                    on_copy_prompt=copy_job_prompt,
-                    on_duplicate_as_draft=duplicate_job_as_draft,
-                    on_delete=confirm_delete,
-                ))
+                        page, entry, jobs_by_filename.get(entry.path.name),
+                        on_copy_prompt=copy_job_prompt,
+                        on_duplicate_as_draft=duplicate_job_as_draft,
+                        on_delete=confirm_delete,
+                        downloaded=entry.rel_path in downloaded_rel_paths,
+                    ))
 
         list_column.controls = controls
         try:

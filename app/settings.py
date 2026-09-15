@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     # Concurrency
     max_concurrent_jobs: int = 2
 
+    # One-at-a-time mode: submit the next job only after the previous one
+    # is fully finished (Seedance 2.5 errors out when two tasks sit in
+    # Runway's queue at once). Toggled live from the UI; this is the
+    # default for a fresh process. Overridable via RUNWAY_SEQUENTIAL_JOBS.
+    sequential_jobs: bool = False
+
     # Random pause a worker takes after finishing one job and before pulling
     # the next from the queue — gives the run more human-like cadence and
     # eases pressure on Runway. Each worker rolls a fresh value in this

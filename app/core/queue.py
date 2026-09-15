@@ -7,6 +7,10 @@ shared `asyncio.Queue` and run jobs through their full lifecycle. Workers
 live for the entire app session — you can `add_jobs(...)` at any time, even
 while previous jobs are still running.
 
+One-at-a-time mode (`sequential = True`) makes workers take turns holding
+a shared lock around get → run → pause, so only a single job is ever
+submitted to Runway; the rest wait in the local queue as PENDING.
+
 On 429
 ------
 Workers do their own patient retry: 30s → 60s → 180s → 240s → 300s and
@@ -116,6 +120,11 @@ class BatchRunner:
         # add_jobs() so the user can later rearrange PENDING cards via the
         # ▲/▼ buttons (see reorder_pending()).
         self._next_queue_order: int = 1
+
+        # One-at-a-time mode — see `sequential`. Read by workers at the top
+        # of every pickup, so flipping it takes effect on the next job.
+        self._sequential: bool = settings.sequential_jobs
+        self._serial_lock = asyncio.Lock()
 
     # ── public API ───────────────────────────────────────────────────
 
@@ -281,6 +290,17 @@ class BatchRunner:
 
     async def resume_jobs(self, jobs: list[Job]) -> None:
         await self.add_jobs(jobs, is_resume=True)
+
+    @property
+    def sequential(self) -> bool:
+        """True → submit one job at a time instead of `max_concurrent`."""
+        return self._sequential
+
+    @sequential.setter
+    def sequential(self, value: bool) -> None:
+        # Plain attribute write — safe from Flet's handler threads.
+        self._sequential = bool(value)
+        logger.info("BatchRunner sequential mode → {}", self._sequential)
 
     @property
     def is_idle(self) -> bool:
@@ -500,47 +520,63 @@ class BatchRunner:
         # it (CPython issue #94720). Shutdown is signalled by aclose()
         # putting one None sentinel per worker.
         while True:
-            job = await self._queue.get()
-            if job is None:
-                return
-            if self._cancel_event.is_set():
-                # Soft shutdown happened while we were blocked on get().
-                # Put the job back so the next session's resume_jobs picks
-                # it up, then exit.
-                with suppress(asyncio.QueueFull):
-                    self._queue.put_nowait(job)
-                return
-
-            # Run the job in a child task and store THAT in _inflight.
-            # Previously _inflight held `current` (= the worker task), so
-            # cancel_one() cancelled the worker itself — after one user
-            # cancel the worker died and the remaining queued jobs sat
-            # untouched. With a per-job sub-task, cancel_one only kills
-            # this job; the worker survives to pick up the next item.
-            job_task: asyncio.Task[Any] = asyncio.create_task(
-                self._run_one(job), name=f"runway-job-{job.id}",
-            )
-            self._inflight[job.id] = job_task
+            # In one-at-a-time mode hold the serial lock across get → run →
+            # pause. The other worker blocks on the lock rather than on the
+            # queue, so waiting jobs stay in the queue (still reorderable /
+            # purgeable) instead of being pulled out early.
+            serial = self._sequential
+            if serial:
+                await self._serial_lock.acquire()
             try:
-                await job_task
-            except asyncio.CancelledError:
+                job = await self._queue.get()
+                if job is None:
+                    return
                 if self._cancel_event.is_set():
-                    # Full shutdown signalled (aclose). Let it propagate.
-                    raise
-                # Per-job cancel — _run_one already marked the job
-                # CANCELLED. Stay alive and pick up the next one.
-                logger.info(
-                    "worker {} job {} cancelled — continuing",
-                    worker_index, job.id,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("worker {} crashed on job {}", worker_index, job.id)
-            finally:
-                self._inflight.pop(job.id, None)
+                    # Soft shutdown happened while we were blocked on get().
+                    # Put the job back so the next session's resume_jobs picks
+                    # it up, then exit.
+                    with suppress(asyncio.QueueFull):
+                        self._queue.put_nowait(job)
+                    return
+                if self._sequential and not serial:
+                    # Mode was switched on while we sat in get() — wait for
+                    # the job currently in flight before running this one.
+                    await self._serial_lock.acquire()
+                    serial = True
 
-            # Cool-down between consecutive jobs. Interruptible by cancel
-            # so the user doesn't have to wait through a 60s pause to abort.
-            await self._post_job_pause(worker_index)
+                # Run the job in a child task and store THAT in _inflight.
+                # Previously _inflight held `current` (= the worker task), so
+                # cancel_one() cancelled the worker itself — after one user
+                # cancel the worker died and the remaining queued jobs sat
+                # untouched. With a per-job sub-task, cancel_one only kills
+                # this job; the worker survives to pick up the next item.
+                job_task: asyncio.Task[Any] = asyncio.create_task(
+                    self._run_one(job), name=f"runway-job-{job.id}",
+                )
+                self._inflight[job.id] = job_task
+                try:
+                    await job_task
+                except asyncio.CancelledError:
+                    if self._cancel_event.is_set():
+                        # Full shutdown signalled (aclose). Let it propagate.
+                        raise
+                    # Per-job cancel — _run_one already marked the job
+                    # CANCELLED. Stay alive and pick up the next one.
+                    logger.info(
+                        "worker {} job {} cancelled — continuing",
+                        worker_index, job.id,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("worker {} crashed on job {}", worker_index, job.id)
+                finally:
+                    self._inflight.pop(job.id, None)
+
+                # Cool-down between consecutive jobs. Interruptible by cancel
+                # so the user doesn't have to wait through a 60s pause to abort.
+                await self._post_job_pause(worker_index)
+            finally:
+                if serial:
+                    self._serial_lock.release()
 
     async def _post_job_pause(self, worker_index: int) -> None:
         """Random pause between this worker's consecutive job pickups.

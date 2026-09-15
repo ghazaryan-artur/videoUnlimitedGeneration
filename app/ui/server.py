@@ -26,6 +26,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 from loguru import logger
 
+from app.core import storage
 from app.core.runtime import runtime
 from app.paths import output_dir
 
@@ -92,9 +93,25 @@ def _safe_directory_path(rel_path: str) -> Path:
     return path
 
 
-def _build_folder_zip(folder: Path) -> Path:
-    """Bundle every (non-hidden, non-.part) file under `folder` into a new
-    temp .zip and return its path.
+def _iter_bundle_files(folder: Path) -> list[Path]:
+    """Every (non-hidden, non-.part) file under `folder`, sorted — the same
+    filter `_build_folder_zip` bundles, reused so the download-tracking
+    marks exactly what actually went into the archive."""
+    out = []
+    for sub in sorted(folder.rglob("*")):
+        if not sub.is_file():
+            continue
+        if sub.name.startswith(".") or sub.suffix == ".part":
+            continue
+        if any(p.startswith(".") for p in sub.relative_to(folder).parts):
+            continue
+        out.append(sub)
+    return out
+
+
+def _build_folder_zip(folder: Path, files: list[Path]) -> Path:
+    """Bundle `files` (all under `folder`) into a new temp .zip and return
+    its path.
 
     Stored without compression (ZIP_STORED) — mp4s are already compressed,
     so deflate would burn CPU for no size win. arcname is relative to
@@ -108,13 +125,7 @@ def _build_folder_zip(folder: Path) -> Path:
     tmp_path = Path(tmp_name)
     try:
         with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_STORED) as zf:
-            for sub in sorted(folder.rglob("*")):
-                if not sub.is_file():
-                    continue
-                if sub.name.startswith(".") or sub.suffix == ".part":
-                    continue
-                if any(p.startswith(".") for p in sub.relative_to(folder).parts):
-                    continue
+            for sub in files:
                 zf.write(sub, arcname=sub.relative_to(folder).as_posix())
     except Exception:
         tmp_path.unlink(missing_ok=True)
@@ -163,13 +174,21 @@ def build_app(target: SessionHandler) -> FastAPI:
                 return PlainTextResponse(
                     str(e.detail or ""), status_code=e.status_code,
                 )
+            bundle_files = _iter_bundle_files(folder)
             try:
-                zip_path = _build_folder_zip(folder)
+                zip_path = _build_folder_zip(folder, bundle_files)
             except Exception as e:  # noqa: BLE001
                 logger.warning("zip build failed for {}: {}", folder, e)
                 return PlainTextResponse(
                     "could not build archive", status_code=500,
                 )
+            # Best-effort: every video in the bundle counts as downloaded.
+            root = output_dir().resolve()
+            for f in bundle_files:
+                try:
+                    await storage.mark_file_downloaded(f.resolve().relative_to(root).as_posix())
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("mark_file_downloaded failed for {}: {}", f, e)
             from starlette.background import BackgroundTask
 
             def _cleanup(p: Path) -> None:
@@ -194,6 +213,10 @@ def build_app(target: SessionHandler) -> FastAPI:
                 return PlainTextResponse(
                     str(e.detail or ""), status_code=e.status_code,
                 )
+            try:
+                await storage.mark_file_downloaded(filename)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("mark_file_downloaded failed for {}: {}", filename, e)
             return FileResponse(
                 file_path,
                 media_type="application/octet-stream",

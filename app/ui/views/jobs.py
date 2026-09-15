@@ -37,6 +37,7 @@ from app.paths import is_web_mode, output_dir
 from app.runway.auth import clear_token
 from app.runway.models import SEEDANCE_2
 from app.security.license_ledger import has_private_key
+from app.settings import settings
 from app.ui import theme
 from app.ui.state import AppState
 from app.ui.widgets.job_card import JobCard
@@ -1692,6 +1693,32 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
         label_style=ft.TextStyle(size=12, color=theme.Colors.text_secondary),
     )
 
+    def on_sequential_toggle(e: ft.ControlEvent) -> None:
+        enabled = bool(e.control.value)
+        # Remember process-wide so a runner rebuilt after re-login keeps it.
+        settings.sequential_jobs = enabled
+        if state.runner is not None:
+            state.runner.sequential = enabled
+        page.snack_bar = ft.SnackBar(
+            ft.Text(
+                "One at a time: the next video is sent only after the current one finishes."
+                if enabled else
+                f"Parallel: up to {settings.max_concurrent_jobs} videos at once."
+            ),
+            bgcolor=theme.Colors.surface_2,
+        )
+        page.snack_bar.open = True
+        page.update()
+
+    sequential_switch = ft.Switch(
+        label="One at a time",
+        value=state.runner.sequential if state.runner is not None else settings.sequential_jobs,
+        on_change=on_sequential_toggle,
+        active_color=theme.Colors.primary,
+        label_style=ft.TextStyle(size=12, color=theme.Colors.text_secondary),
+        tooltip="Send queued videos to Runway one by one (needed for Seedance 2.5)",
+    )
+
     add_btn = theme.secondary_button("Add prompt", on_click=add_prompt, icon=ft.Icons.ADD)
     start_btn = theme.primary_button("Start batch", on_click=start_batch, icon=ft.Icons.PLAY_ARROW)
     cancel_all_btn = ft.TextButton(
@@ -1785,6 +1812,8 @@ def build_jobs_view(page: ft.Page, state: AppState) -> ft.View:
                     [
                         summary_label,
                         ft.Container(expand=True),
+                        sequential_switch,
+                        ft.Container(width=12),
                         auto_shutdown_switch,
                         ft.Container(width=12),
                         batch_progress,

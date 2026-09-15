@@ -17,7 +17,9 @@ class Colors:
     surface = "#161821"
     surface_2 = "#1E2230"
     surface_3 = "#262B3C"
+    surface_done = "#1F3027"   # subtle green tint over surface_2 — "already downloaded" marker
     border = "#2D3346"
+    border_done = "#2F5A45"    # matching border for surface_done
 
     # Text
     text_primary = "#F4F5FA"
