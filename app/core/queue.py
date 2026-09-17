@@ -7,9 +7,10 @@ shared `asyncio.Queue` and run jobs through their full lifecycle. Workers
 live for the entire app session — you can `add_jobs(...)` at any time, even
 while previous jobs are still running.
 
-One-at-a-time mode (`sequential = True`) makes workers take turns holding
-a shared lock around get → run → pause, so only a single job is ever
-submitted to Runway; the rest wait in the local queue as PENDING.
+One-at-a-time mode (`sequential = True`) makes workers take turns: one
+worker holds the "turn" across get → run → pause, so only a single job is
+ever submitted to Runway; the rest wait in the local queue as PENDING.
+Flipping the mode wakes waiting workers immediately (see `_gate`).
 
 On 429
 ------
@@ -121,10 +122,14 @@ class BatchRunner:
         # ▲/▼ buttons (see reorder_pending()).
         self._next_queue_order: int = 1
 
-        # One-at-a-time mode — see `sequential`. Read by workers at the top
-        # of every pickup, so flipping it takes effect on the next job.
+        # One-at-a-time mode — see `sequential`. `_turn_holder` is the index
+        # of the worker currently allowed to pick up / run a job; the others
+        # wait on `_gate`, which is notified whenever the turn is released,
+        # a job finishes, or the mode is flipped (so switching it OFF lets
+        # the idle worker start right away instead of after the current job).
         self._sequential: bool = settings.sequential_jobs
-        self._serial_lock = asyncio.Lock()
+        self._turn_holder: int | None = None
+        self._gate = asyncio.Condition()
 
     # ── public API ───────────────────────────────────────────────────
 
@@ -298,9 +303,40 @@ class BatchRunner:
 
     @sequential.setter
     def sequential(self, value: bool) -> None:
-        # Plain attribute write — safe from Flet's handler threads.
+        # Called from Flet's handler threads — the attribute write is atomic,
+        # waking the workers has to happen on the runner loop.
         self._sequential = bool(value)
         logger.info("BatchRunner sequential mode → {}", self._sequential)
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self._on_mode_change()),
+            )
+
+    async def _on_mode_change(self) -> None:
+        async with self._gate:
+            if not self._sequential:
+                # Parallel again — nobody owns the turn any more.
+                self._turn_holder = None
+            self._gate.notify_all()
+
+    async def _wait_for_turn(self, worker_index: int) -> bool:
+        """Block until this worker may run a job. Returns True if it took
+        the serial turn (and must release it), False in parallel mode."""
+        async with self._gate:
+            await self._gate.wait_for(
+                lambda: not self._sequential
+                or (self._turn_holder is None and not self._inflight)
+            )
+            if not self._sequential:
+                return False
+            self._turn_holder = worker_index
+            return True
+
+    async def _release_turn(self, worker_index: int) -> None:
+        async with self._gate:
+            if self._turn_holder == worker_index:
+                self._turn_holder = None
+            self._gate.notify_all()
 
     @property
     def is_idle(self) -> bool:
@@ -520,13 +556,11 @@ class BatchRunner:
         # it (CPython issue #94720). Shutdown is signalled by aclose()
         # putting one None sentinel per worker.
         while True:
-            # In one-at-a-time mode hold the serial lock across get → run →
-            # pause. The other worker blocks on the lock rather than on the
-            # queue, so waiting jobs stay in the queue (still reorderable /
+            # In one-at-a-time mode hold the turn across get → run → pause.
+            # The other worker waits for the turn rather than on the queue,
+            # so waiting jobs stay in the queue (still reorderable /
             # purgeable) instead of being pulled out early.
-            serial = self._sequential
-            if serial:
-                await self._serial_lock.acquire()
+            serial = await self._wait_for_turn(worker_index)
             try:
                 job = await self._queue.get()
                 if job is None:
@@ -541,8 +575,7 @@ class BatchRunner:
                 if self._sequential and not serial:
                     # Mode was switched on while we sat in get() — wait for
                     # the job currently in flight before running this one.
-                    await self._serial_lock.acquire()
-                    serial = True
+                    serial = await self._wait_for_turn(worker_index)
 
                 # Run the job in a child task and store THAT in _inflight.
                 # Previously _inflight held `current` (= the worker task), so
@@ -570,13 +603,15 @@ class BatchRunner:
                     logger.exception("worker {} crashed on job {}", worker_index, job.id)
                 finally:
                     self._inflight.pop(job.id, None)
+                    async with self._gate:
+                        self._gate.notify_all()
 
                 # Cool-down between consecutive jobs. Interruptible by cancel
                 # so the user doesn't have to wait through a 60s pause to abort.
                 await self._post_job_pause(worker_index)
             finally:
                 if serial:
-                    self._serial_lock.release()
+                    await self._release_turn(worker_index)
 
     async def _post_job_pause(self, worker_index: int) -> None:
         """Random pause between this worker's consecutive job pickups.
